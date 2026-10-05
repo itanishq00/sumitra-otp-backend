@@ -1,161 +1,146 @@
-const crypto = require("crypto");
-const admin = require("firebase-admin");
-const {
-  getFirestore,
-  Timestamp,
-} = require("firebase-admin/firestore");
+const https = require("https");
 
-const serviceAccount = require("../gas-agency-app-54892e678200.json");
+module.exports = async (req, res) => {
+  // CORS
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 
-if (admin.getApps().length === 0) {
-  admin.initializeApp({
-    credential: admin.cert(serviceAccount),
-  });
-}
+  if (req.method === "OPTIONS") {
+    return res.status(200).end();
+  }
 
-const db = getFirestore();
-
-function hashValue(value) {
-  return crypto
-    .createHash("sha256")
-    .update(value)
-    .digest("hex");
-}
-
-module.exports = async function verifyOtp(req, res) {
   if (req.method !== "POST") {
     return res.status(405).json({
       success: false,
-      message: "Method not allowed.",
+      message: "Method not allowed"
     });
   }
 
   try {
-    const { email, otp } = req.body || {};
+    const {
+      mobileNumber,
+      otp,
+      verificationId
+    } = req.body || {};
 
-    if (
-      typeof email !== "string" ||
-      typeof otp !== "string"
-    ) {
+    if (!mobileNumber || !otp || !verificationId) {
       return res.status(400).json({
         success: false,
-        message: "Email and OTP are required.",
+        message: "Mobile number, OTP and verification ID are required."
       });
     }
 
-    const normalizedEmail = email.trim().toLowerCase();
-    const normalizedOtp = otp.trim();
+    const cleanedNumber = String(mobileNumber).replace(/\D/g, "");
+    const cleanedOtp = String(otp).trim();
 
-    const emailRegex =
-      /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-
-    if (!emailRegex.test(normalizedEmail)) {
+    if (cleanedNumber.length !== 10) {
       return res.status(400).json({
         success: false,
-        message: "Invalid email address.",
+        message: "Invalid mobile number."
       });
     }
 
-    if (!/^\d{6}$/.test(normalizedOtp)) {
+    if (!/^\d{4,6}$/.test(cleanedOtp)) {
       return res.status(400).json({
         success: false,
-        message: "OTP must be 6 digits.",
+        message: "Invalid OTP."
       });
     }
 
-    const emailHash = hashValue(normalizedEmail);
-    const otpHash = hashValue(normalizedOtp);
+    const customerId = process.env.MESSAGE_CENTRAL_CUSTOMER_ID;
+    const authToken = process.env.MESSAGE_CENTRAL_AUTH_TOKEN;
 
-    const snapshot = await db
-      .collection("otp_requests")
-      .where("emailHash", "==", emailHash)
-      .where("verified", "==", false)
-      .where("invalidated", "==", false)
-      .get();
+    if (!customerId || !authToken) {
+      console.error("Message Central credentials missing");
 
-    if (snapshot.empty) {
-      return res.status(400).json({
+      return res.status(500).json({
         success: false,
-        message:
-          "No active OTP found. Please request a new OTP.",
+        message: "OTP service configuration missing."
       });
     }
 
-    const documents = snapshot.docs.sort((a, b) => {
-      const aTime =
-        a.data().createdAt?.toMillis?.() || 0;
+    const url = new URL(
+      "https://cpaas.messagecentral.com/verification/v3/validateOtp"
+    );
 
-      const bTime =
-        b.data().createdAt?.toMillis?.() || 0;
+    url.searchParams.set("countryCode", "91");
+    url.searchParams.set("mobileNumber", cleanedNumber);
+    url.searchParams.set("verificationId", String(verificationId));
+    url.searchParams.set("customerId", customerId);
+    url.searchParams.set("code", cleanedOtp);
 
-      return bTime - aTime;
+    const options = {
+      method: "GET",
+      headers: {
+        authToken: authToken
+      }
+    };
+
+    const request = https.request(url, options, (response) => {
+      let data = "";
+
+      response.on("data", (chunk) => {
+        data += chunk;
+      });
+
+      response.on("end", () => {
+        try {
+          const result = JSON.parse(data);
+
+          console.log("Message Central Verify OTP:", result);
+
+          if (
+            response.statusCode === 200 &&
+            result.responseCode === 200 &&
+            result.data?.verificationStatus ===
+              "VERIFICATION_COMPLETED"
+          ) {
+            return res.status(200).json({
+              success: true,
+              message: "OTP verified successfully."
+            });
+          }
+
+          if (result.responseCode === 705) {
+            return res.status(400).json({
+              success: false,
+              message: "OTP expired. Please request a new OTP."
+            });
+          }
+
+          return res.status(400).json({
+            success: false,
+            message: result.message || "Invalid OTP.",
+            details: result
+          });
+        } catch (error) {
+          console.error("Message Central verify response error:", error);
+
+          return res.status(500).json({
+            success: false,
+            message: "Invalid response from OTP service."
+          });
+        }
+      });
     });
 
-    const otpDoc = documents[0];
-    const otpData = otpDoc.data();
+    request.on("error", (error) => {
+      console.error("Message Central verify request error:", error);
 
-    if (!otpData.expiresAt) {
-      return res.status(400).json({
+      return res.status(500).json({
         success: false,
-        message:
-          "OTP expiry information is missing.",
+        message: "Unable to connect to OTP service."
       });
-    }
-
-    if (Date.now() > otpData.expiresAt.toMillis()) {
-      await otpDoc.ref.update({
-        invalidated: true,
-      });
-
-      return res.status(400).json({
-        success: false,
-        message:
-          "OTP has expired. Please request a new OTP.",
-      });
-    }
-
-    const attempts =
-      Number(otpData.attempts || 0);
-
-    if (attempts >= 5) {
-      await otpDoc.ref.update({
-        invalidated: true,
-      });
-
-      return res.status(429).json({
-        success: false,
-        message:
-          "Too many incorrect attempts. Please request a new OTP.",
-      });
-    }
-
-    if (otpData.otpHash !== otpHash) {
-      await otpDoc.ref.update({
-        attempts: attempts + 1,
-      });
-
-      return res.status(400).json({
-        success: false,
-        message: "Incorrect OTP.",
-      });
-    }
-
-    await otpDoc.ref.update({
-      verified: true,
-      verifiedAt: Timestamp.now(),
     });
 
-    return res.status(200).json({
-      success: true,
-      message: "OTP verified successfully.",
-    });
-
+    request.end();
   } catch (error) {
     console.error("Verify OTP error:", error);
 
     return res.status(500).json({
       success: false,
-      message: "Unable to verify OTP.",
+      message: "Unable to verify OTP."
     });
   }
 };

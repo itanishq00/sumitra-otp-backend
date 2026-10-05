@@ -1,161 +1,125 @@
-require("dotenv").config();
+const https = require("https");
 
-const crypto = require("crypto");
-const admin = require("firebase-admin");
-const { getFirestore, Timestamp, FieldValue } = require("firebase-admin/firestore");
-const { Resend } = require("resend");
+module.exports = async (req, res) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 
-const serviceAccount = require("../gas-agency-app-54892e678200.json");
+  if (req.method === "OPTIONS") {
+    return res.status(200).end();
+  }
 
-if (admin.getApps().length === 0) {
-  admin.initializeApp({
-    credential: admin.cert(serviceAccount),
-  });
-}
-
-const db = getFirestore();
-const resend = new Resend(process.env.RESEND_API_KEY);
-
-function hashValue(value) {
-  return crypto
-    .createHash("sha256")
-    .update(value)
-    .digest("hex");
-}
-
-function generateOtp() {
-  return crypto.randomInt(100000, 1000000).toString();
-}
-
-async function sendOtp(req, res) {
   if (req.method !== "POST") {
     return res.status(405).json({
       success: false,
-      message: "Method not allowed",
+      message: "Method not allowed"
     });
   }
 
   try {
-    const email = req.body?.email;
+    const { mobileNumber } = req.body || {};
 
-    if (!email || typeof email !== "string") {
+    if (!mobileNumber) {
       return res.status(400).json({
         success: false,
-        message: "Email is required.",
+        message: "Mobile number is required."
       });
     }
 
-    const normalizedEmail = email.trim().toLowerCase();
+    const cleanedNumber = String(mobileNumber).replace(/\D/g, "");
 
-    const otp = generateOtp();
-    const otpHash = hashValue(otp);
-    const emailHash = hashValue(normalizedEmail);
-
-    const expiresAt = new Date(
-      Date.now() + 10 * 60 * 1000
-    );
-
-    const oldRequests = await db
-      .collection("otp_requests")
-      .where("emailHash", "==", emailHash)
-      .where("verified", "==", false)
-      .where("invalidated", "==", false)
-      .get();
-
-    const batch = db.batch();
-
-    oldRequests.forEach((doc) => {
-      batch.update(doc.ref, {
-        invalidated: true,
+    if (cleanedNumber.length !== 10) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid mobile number."
       });
-    });
-
-    if (!oldRequests.empty) {
-      await batch.commit();
     }
 
-    await db.collection("otp_requests").add({
-      emailHash: emailHash,
-      otpHash: otpHash,
-      expiresAt: Timestamp.fromDate(expiresAt),
-      attempts: 0,
-      verified: false,
-      invalidated: false,
-      createdAt: FieldValue.serverTimestamp(),
-    });
+    const authToken = process.env.MESSAGE_CENTRAL_AUTH_TOKEN;
 
-    const result = await resend.emails.send({
-      from: process.env.RESEND_FROM_EMAIL,
-      to: [normalizedEmail],
-      subject: "Your Sumitra HP Gas Verification OTP",
-
-      html: `
-        <div style="font-family:Arial,sans-serif;max-width:500px;margin:auto;padding:20px">
-
-          <h2 style="color:#1976D2">
-            SUMITRA HP GAS
-          </h2>
-
-          <p>
-            Your verification OTP is:
-          </p>
-
-          <div style="
-            font-size:32px;
-            font-weight:bold;
-            letter-spacing:8px;
-            padding:20px;
-            background:#EAF6FF;
-            text-align:center;
-            border-radius:12px;
-          ">
-            ${otp}
-          </div>
-
-          <p>
-            This OTP is valid for
-            <strong>10 minutes</strong>.
-          </p>
-
-          <p>
-            If you did not request this OTP,
-            please ignore this email.
-          </p>
-
-          <hr>
-
-          <p style="color:#78909C;font-size:12px">
-            Sumitra HP Gas — Rasalpur
-          </p>
-
-        </div>
-      `,
-    });
-
-    if (result.error) {
-      console.error("Resend error:", result.error);
+    if (!authToken) {
+      console.error("Message Central auth token missing");
 
       return res.status(500).json({
         success: false,
-        message: "Unable to send OTP.",
+        message: "OTP service configuration missing."
       });
     }
 
-    console.log("OTP sent to:", normalizedEmail);
+    const url = new URL(
+      "https://cpaas.messagecentral.com/verification/v3/send"
+    );
 
-    return res.status(200).json({
-      success: true,
-      message: "OTP sent successfully.",
+    url.searchParams.set("countryCode", "91");
+    url.searchParams.set("flowType", "SMS");
+    url.searchParams.set("mobileNumber", cleanedNumber);
+
+    const request = https.request(
+      url,
+      {
+        method: "POST",
+        headers: {
+          authToken: authToken
+        }
+      },
+      (response) => {
+        let data = "";
+
+        response.on("data", (chunk) => {
+          data += chunk;
+        });
+
+        response.on("end", () => {
+          try {
+            const result = JSON.parse(data);
+
+            console.log("Message Central Send OTP:", result);
+
+            if (
+              response.statusCode === 200 &&
+              result.responseCode === 200 &&
+              result.data &&
+              result.data.verificationId
+            ) {
+              return res.status(200).json({
+                success: true,
+                message: "OTP sent successfully.",
+                verificationId: String(result.data.verificationId)
+              });
+            }
+
+            return res.status(400).json({
+              success: false,
+              message: result.message || "Unable to send OTP."
+            });
+          } catch (error) {
+            console.error("Response parsing error:", error);
+
+            return res.status(500).json({
+              success: false,
+              message: "Invalid response from OTP service."
+            });
+          }
+        });
+      }
+    );
+
+    request.on("error", (error) => {
+      console.error("Message Central request error:", error);
+
+      return res.status(500).json({
+        success: false,
+        message: "Unable to connect to OTP service."
+      });
     });
 
+    request.end();
   } catch (error) {
     console.error("Send OTP error:", error);
 
     return res.status(500).json({
       success: false,
-      message: error.message || "Unable to send OTP.",
+      message: "Unable to send OTP."
     });
   }
-}
-
-module.exports = sendOtp;
+};
