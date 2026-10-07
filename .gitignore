@@ -3,3 +3,5 @@ node_modules/
 service-account.json
 gas-agency-app-54892e678200.json
 .DS_Store
+.vercel
+.env*
