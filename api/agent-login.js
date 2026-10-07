@@ -23,6 +23,14 @@ function validPassword(p) {
 
 module.exports = async (req, res) => {
   if (cors(req, res)) return;
+  if (req.method === 'GET') {
+    try {
+      admin.ensureApp();
+      return send(res, 200, true, 'agent-login ready');
+    } catch (e) {
+      return send(res, 500, false, `Init error: ${e.message}`);
+    }
+  }
   if (req.method !== 'POST') return send(res, 405, false, 'Method not allowed');
 
   let owner;

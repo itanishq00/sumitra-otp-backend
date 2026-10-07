@@ -1,24 +1,54 @@
-// firebase-admin v14 modular API.
-// Purane jaisa shape export karte hain: admin.auth(), admin.firestore(),
-// admin.firestore.FieldValue — taaki baaki files na badalni padein.
-const { initializeApp, getApps, cert } = require('firebase-admin/app');
-const { getAuth } = require('firebase-admin/auth');
-const { getFirestore, FieldValue } = require('firebase-admin/firestore');
+// firebase-admin modular API, lazy load.
+// File load hote waqt kuch nahi hota; pehli zarurat par init hota hai.
+// Isse init fail ho to function crash nahi karta, error message milta hai.
+let mods = null;
 
-if (!getApps().length) {
-  initializeApp({
-    credential: cert({
-      projectId: process.env.FIREBASE_PROJECT_ID,
-      clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-      privateKey: (process.env.FIREBASE_PRIVATE_KEY || '').replace(/\\n/g, '\n'),
-    }),
+function load() {
+  if (!mods) {
+    mods = {
+      app: require('firebase-admin/app'),
+      auth: require('firebase-admin/auth'),
+      fs: require('firebase-admin/firestore'),
+    };
+  }
+  return mods;
+}
+
+function ensureApp() {
+  const { app } = load();
+  if (app.getApps().length) return;
+
+  const projectId = process.env.FIREBASE_PROJECT_ID;
+  const clientEmail = process.env.FIREBASE_CLIENT_EMAIL;
+  const privateKey = (process.env.FIREBASE_PRIVATE_KEY || '')
+    .replace(/^"|"$/g, '')
+    .replace(/\\n/g, '\n');
+
+  if (!projectId || !clientEmail || !privateKey) {
+    throw new Error(
+      'Firebase env variables server par missing hain ' +
+      '(FIREBASE_PROJECT_ID / FIREBASE_CLIENT_EMAIL / FIREBASE_PRIVATE_KEY).'
+    );
+  }
+
+  app.initializeApp({
+    credential: app.cert({ projectId, clientEmail, privateKey }),
   });
 }
 
-const firestore = () => getFirestore();
-firestore.FieldValue = FieldValue;
+const firestore = () => {
+  ensureApp();
+  return load().fs.getFirestore();
+};
+Object.defineProperty(firestore, 'FieldValue', {
+  get: () => load().fs.FieldValue,
+});
 
 module.exports = {
-  auth: () => getAuth(),
+  ensureApp,
+  auth: () => {
+    ensureApp();
+    return load().auth.getAuth();
+  },
   firestore,
 };
