@@ -57,7 +57,11 @@ module.exports = async (req, res) => {
 
     const email = `${mobile}@${AGENT_DOMAIN}`;
     const disabled = !LOGIN_ALLOWED_STATUSES.includes(agent.status);
-    const claims = { role: 'delivery_agent', agencyId: AGENCY_ID, agentId };
+    const agentAgency = agent.agencyId || AGENCY_ID;
+    if (agentAgency !== (owner.agencyId || AGENCY_ID)) {
+      return send(res, 403, false, 'Ye agent aapki agency ka nahi hai.');
+    }
+    const claims = { role: 'delivery_agent', agencyId: agentAgency, agentId };
 
     // ---------- CREATE ----------
     if (action === 'create') {

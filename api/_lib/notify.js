@@ -5,8 +5,10 @@ const { AGENCY_ID } = require('./auth');
 // jaise 'AGENT_ASSIGNED', 'OUT_FOR_DELIVERY', 'DELIVERED'.
 const ENABLED_TYPES = new Set(['COMPLAINT_CREATED']);
 
-async function ownerUids() {
-  const snap = await admin.firestore().collection('admins').get();
+async function ownerUids(agencyId) {
+  const snap = await admin.firestore().collection('admins')
+    .where('agencyId', '==', agencyId || AGENCY_ID)
+    .get();
   return snap.docs.map((d) => d.id);
 }
 

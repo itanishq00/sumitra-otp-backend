@@ -43,14 +43,14 @@ async function requireOwner(req) {
   await admin.auth().setCustomUserClaims(decoded.uid, {
     ...(user.customClaims || {}),
     role: 'owner',
-    agencyId: AGENCY_ID,
+    agencyId: (user.customClaims || {}).agencyId || AGENCY_ID,
   });
-  return decoded;
+  return { ...decoded, agencyId: (user.customClaims || {}).agencyId || AGENCY_ID };
 }
 
 function auditLog(actor, action, targetId, oldValue, newValue) {
   return {
-    agencyId: AGENCY_ID,
+    agencyId: actor.agencyId || AGENCY_ID,
     actorId: actor.uid,
     actorEmail: actor.email || '',
     actorRole: 'owner',

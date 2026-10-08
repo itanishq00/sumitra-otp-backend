@@ -77,7 +77,7 @@ module.exports = async (req, res) => {
 
       if (event === 'BOOKING_CREATED') {
         if (b.customerId !== user.uid) return deny();
-        return done(await sendToUsers(await ownerUids(), {
+        return done(await sendToUsers(await ownerUids(b.agencyId), {
           ...base, dedupeKey: `${event}_${refId}`,
           title: 'Nayi booking 🔔', body: `${cname}: ${label(b)}`,
         }));
@@ -116,7 +116,7 @@ module.exports = async (req, res) => {
 
       if (event === 'AGENT_REJECTED') {
         if (b.orderStatus !== 'CONFIRMED' || b.agentRejectedBy !== user.agentId) return deny();
-        return done(await sendToUsers(await ownerUids(), {
+        return done(await sendToUsers(await ownerUids(b.agencyId), {
           ...base, title: 'Agent ne delivery reject ki ⚠️',
           body: `${cname} • Reason: ${b.agentRejectReason || '-'}. Dobara assign karo.`,
         }));
@@ -126,14 +126,14 @@ module.exports = async (req, res) => {
       const agentName = b.agentName || 'Agent';
 
       if (event === 'AGENT_ACCEPTED' && b.orderStatus === 'ACCEPTED') {
-        return done(await sendToUsers(await ownerUids(), {
+        return done(await sendToUsers(await ownerUids(b.agencyId), {
           ...base, title: 'Delivery accepted',
           body: `${agentName} ne ${cname} ki delivery accept ki.`,
         }));
       }
 
       if (event === 'OUT_FOR_DELIVERY' && b.orderStatus === 'OUT_FOR_DELIVERY') {
-        await sendToUsers(await ownerUids(), {
+        await sendToUsers(await ownerUids(b.agencyId), {
           ...base, dedupeKey: `${key}_owner`,
           title: 'Delivery shuru', body: `${agentName} → ${cname}`,
         });
@@ -150,7 +150,7 @@ module.exports = async (req, res) => {
       }
 
       if (event === 'DELIVERY_FAILED' && FAIL.includes(b.orderStatus)) {
-        await sendToUsers(await ownerUids(), {
+        await sendToUsers(await ownerUids(b.agencyId), {
           ...base, dedupeKey: `${key}_owner`,
           title: 'Delivery fail ⚠️',
           body: `${cname}: ${b.failureReason || b.orderStatus}. Dobara assign karo.`,
@@ -184,7 +184,7 @@ module.exports = async (req, res) => {
 
       if (event === 'COMPLAINT_CREATED') {
         if (d.customerId !== user.uid) return deny();
-        return done(await sendToUsers(await ownerUids(), {
+        return done(await sendToUsers(await ownerUids(d.agencyId), {
           type: event, complaintId: refId, dedupeKey: `${event}_${refId}`,
           title: (d.isSafety || d.category === 'Leakage/safety')
             ? '🚨 GAS LEAKAGE / Safety complaint'

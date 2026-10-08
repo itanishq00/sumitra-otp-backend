@@ -103,7 +103,7 @@ module.exports = async (req, res) => {
 
       const code = String(crypto.randomInt(0, 10000)).padStart(4, '0');
       await otpRef.set({
-        agencyId: AGENCY_ID,
+        agencyId: b.agencyId || AGENCY_ID,
         bookingId,
         customerId: b.customerId || '',
         agentUid: agent.uid,
@@ -241,7 +241,7 @@ module.exports = async (req, res) => {
             customerName: String(b.customerName || '').trim(),
             settled: false,
             customerId: b.customerId || '',
-            agencyId: AGENCY_ID,
+            agencyId: b.agencyId || AGENCY_ID,
             agentId: agent.agentId || '',
             agentUid: agent.uid,
             amount,
@@ -259,6 +259,7 @@ module.exports = async (req, res) => {
         const label = consumerNo ? `${customerName} (Consumer No. ${consumerNo})` : customerName;
 
         tx.set(db.collection('inventoryActivity').doc(), {
+          agencyId: b.agencyId || AGENCY_ID,
           action: 'Customer Booking Delivered',
           section: 'Cylinder',
           item: `${size || ''} kg Cylinder`,
@@ -277,7 +278,7 @@ module.exports = async (req, res) => {
         });
 
         tx.set(db.collection('auditLogs').doc(), {
-          agencyId: AGENCY_ID,
+          agencyId: b.agencyId || AGENCY_ID,
           actorId: agent.uid,
           actorEmail: agent.email || '',
           actorRole: 'delivery_agent',
@@ -291,6 +292,7 @@ module.exports = async (req, res) => {
 
         return {
           done: true,
+          agencyId: b.agencyId || AGENCY_ID,
           customerId: b.customerId || '',
           customerName,
           agentName: agent.name || 'Agent',
@@ -310,7 +312,7 @@ module.exports = async (req, res) => {
           title: 'Cylinder delivered ✅',
           body: result.amount ? `Thank you! ₹${result.amount} paid in cash.` : 'Thank you!',
         }));
-        await safe(async () => sendToUsers(await ownerUids(), {
+        await safe(async () => sendToUsers(await ownerUids(result.agencyId), {
           type: 'DELIVERED',
           bookingId,
           dedupeKey: `DELIVERED_${bookingId}_owner`,
