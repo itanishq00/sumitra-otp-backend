@@ -186,8 +186,10 @@ module.exports = async (req, res) => {
         if (d.customerId !== user.uid) return deny();
         return done(await sendToUsers(await ownerUids(), {
           type: event, complaintId: refId, dedupeKey: `${event}_${refId}`,
-          title: d.priority === 'Urgent' ? '🚨 Urgent complaint' : 'Nayi complaint',
-          body: `${d.customerName || 'Customer'}: ${d.title || ''}`,
+          title: (d.isSafety || d.category === 'Leakage/safety')
+            ? '🚨 GAS LEAKAGE / Safety complaint'
+            : d.priority === 'Urgent' ? '🚨 Urgent complaint' : 'Nayi complaint',
+          body: `${d.category ? `[${d.category}] ` : ''}${d.customerName || 'Customer'}: ${d.title || ''}`,
         }));
       }
 
