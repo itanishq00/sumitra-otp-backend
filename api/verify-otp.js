@@ -1,4 +1,5 @@
 const https = require("https");
+const { signRegistration } = require("./_lib/regToken");
 
 module.exports = async (req, res) => {
   // CORS
@@ -96,9 +97,17 @@ module.exports = async (req, res) => {
             result.data?.verificationStatus ===
               "VERIFICATION_COMPLETED"
           ) {
+            let registrationToken = null;
+            try {
+              registrationToken = signRegistration(cleanedNumber);
+            } catch (e) {
+              console.error("Registration token error:", e);
+            }
+
             return res.status(200).json({
               success: true,
-              message: "OTP verified successfully."
+              message: "OTP verified successfully.",
+              registrationToken
             });
           }
 
