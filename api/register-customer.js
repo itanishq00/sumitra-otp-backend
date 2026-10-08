@@ -29,7 +29,7 @@ module.exports = async (req, res) => {
   }
   if (req.method !== 'POST') return send(res, 405, false, 'Method not allowed');
 
-  const { registrationToken, name, password } = parseBody(req);
+  const { registrationToken, name, password, agencyId: rawAgencyId } = parseBody(req);
 
   let mobile;
   try {
@@ -50,6 +50,20 @@ module.exports = async (req, res) => {
     return send(res, 400, false, 'Password must contain at least 6 characters.');
   }
 
+  // Customer ne jo agency chuni wo ACTIVE honi chahiye.
+  // Purana app agencyId nahi bhejta: tab pehli agency.
+  const agencyId = String(rawAgencyId || 'sumitra-rasalpur').trim();
+  let agencySnap;
+  try {
+    agencySnap = await admin.firestore().collection('agencies').doc(agencyId).get();
+  } catch (e) {
+    console.error('agency check error:', e);
+    return send(res, 500, false, 'Server error. Please try again.');
+  }
+  if (!agencySnap.exists || String(agencySnap.data().status || '').toUpperCase() !== 'ACTIVE') {
+    return send(res, 400, false, 'Selected gas agency is not available. Please choose again.');
+  }
+
   try {
     let user;
     try {
@@ -65,14 +79,14 @@ module.exports = async (req, res) => {
       throw e;
     }
 
-    await admin.auth().setCustomUserClaims(user.uid, { role: 'customer', agencyId: 'sumitra-rasalpur' });
+    await admin.auth().setCustomUserClaims(user.uid, { role: 'customer', agencyId });
 
     const FieldValue = admin.firestore.FieldValue;
     await admin.firestore().collection('customers').doc(user.uid).set({
       uid: user.uid,
       name: cleanName,
       mobile,
-      agencyId: 'sumitra-rasalpur',
+      agencyId,
       verificationStatus: 'pending',
       consumerNumber: null,
       active: true,

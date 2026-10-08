@@ -20,8 +20,8 @@ function cors(req, res) {
   return false;
 }
 
-// Sirf owner allow. Owner = role claim 'owner' YA admins/{uid} doc.
-// Pehli baar admins-doc wale owner ko 'owner' claim bhi de deta hai.
+// Owner = admins/{uid} doc (status ACTIVE) YA purana 'owner' claim (bina admins doc).
+// Agency hamesha admins doc se aati hai (warna claim se). Claim ko doc ke saath sync rakhta hai.
 async function requireOwner(req) {
   const header = req.headers.authorization || '';
   const match = header.match(/^Bearer (.+)$/);
@@ -34,18 +34,32 @@ async function requireOwner(req) {
     throw httpError(401, 'Session expire ho gaya. Dobara login karo.');
   }
 
-  if (decoded.role === 'owner') return decoded;
-
   const adminDoc = await admin.firestore().collection('admins').doc(decoded.uid).get();
-  if (!adminDoc.exists) throw httpError(403, 'Sirf owner ye kaam kar sakta hai.');
 
-  const user = await admin.auth().getUser(decoded.uid);
-  await admin.auth().setCustomUserClaims(decoded.uid, {
-    ...(user.customClaims || {}),
-    role: 'owner',
-    agencyId: (user.customClaims || {}).agencyId || AGENCY_ID,
-  });
-  return { ...decoded, agencyId: (user.customClaims || {}).agencyId || AGENCY_ID };
+  if (!adminDoc.exists) {
+    if (decoded.role === 'owner') {
+      return { ...decoded, agencyId: decoded.agencyId || AGENCY_ID };
+    }
+    throw httpError(403, 'Sirf owner ye kaam kar sakta hai.');
+  }
+
+  const data = adminDoc.data() || {};
+  const status = String(data.status || 'ACTIVE').trim().toUpperCase();
+  if (status !== 'ACTIVE') {
+    throw httpError(403, `Owner access abhi ${status} hai.`);
+  }
+
+  const agencyId = String(data.agencyId || decoded.agencyId || AGENCY_ID).trim();
+
+  if (decoded.role !== 'owner' || decoded.agencyId !== agencyId) {
+    const user = await admin.auth().getUser(decoded.uid);
+    await admin.auth().setCustomUserClaims(decoded.uid, {
+      ...(user.customClaims || {}),
+      role: 'owner',
+      agencyId,
+    });
+  }
+  return { ...decoded, agencyId };
 }
 
 function auditLog(actor, action, targetId, oldValue, newValue) {
