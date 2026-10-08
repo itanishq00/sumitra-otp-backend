@@ -1,6 +1,10 @@
 const admin = require('./firebase');
 const { AGENCY_ID } = require('./auth');
 
+// Sirf ye notifications bheje jaate hain. Aur chahiye to yahan naam jodo,
+// jaise 'AGENT_ASSIGNED', 'OUT_FOR_DELIVERY', 'DELIVERED'.
+const ENABLED_TYPES = new Set(['COMPLAINT_CREATED']);
+
 async function ownerUids() {
   const snap = await admin.firestore().collection('admins').get();
   return snap.docs.map((d) => d.id);
@@ -11,6 +15,7 @@ async function ownerUids() {
 async function sendToUsers(uids, { type, title, body, bookingId = null, complaintId = null, dedupeKey }) {
   const db = admin.firestore();
   const FieldValue = admin.firestore.FieldValue;
+  if (!ENABLED_TYPES.has(type)) return { sent: 0, disabled: true };
   const unique = [...new Set((uids || []).filter(Boolean))];
   if (!unique.length) return { sent: 0 };
 
