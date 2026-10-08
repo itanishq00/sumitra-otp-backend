@@ -46,6 +46,10 @@ Object.defineProperty(firestore, 'FieldValue', {
 
 module.exports = {
   ensureApp,
+  messaging: () => {
+    ensureApp();
+    return require('firebase-admin/messaging').getMessaging();
+  },
   auth: () => {
     ensureApp();
     return load().auth.getAuth();

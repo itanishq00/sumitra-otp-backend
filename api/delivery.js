@@ -1,6 +1,7 @@
 const crypto = require('crypto');
 const admin = require('./_lib/firebase');
 const { AGENCY_ID, cors, httpError } = require('./_lib/auth');
+const { ownerUids, sendToUsers, safe } = require('./_lib/notify');
 
 const OTP_TTL_MS = 30 * 60 * 1000; // 30 minute
 const MAX_ATTEMPTS = 5;
@@ -111,6 +112,13 @@ module.exports = async (req, res) => {
         expiresAtMs: Date.now() + OTP_TTL_MS,
         createdAt: FieldValue.serverTimestamp(),
       });
+      await safe(() => sendToUsers([b.customerId], {
+        type: 'DELIVERY_OTP',
+        bookingId,
+        dedupeKey: `OTP_${bookingId}_${code}`,
+        title: 'Your delivery OTP is ready',
+        body: 'Open the app to see your OTP. Share it only after you receive your cylinder.',
+      }));
       return send(res, 200, true, 'OTP bhej diya. Customer apne app me OTP dekhega.');
     }
 
@@ -228,11 +236,34 @@ module.exports = async (req, res) => {
           timestamp: FieldValue.serverTimestamp(),
         });
 
-        return { done: true };
+        return {
+          done: true,
+          customerId: b.customerId || '',
+          customerName,
+          agentName: agent.name || 'Agent',
+          amount: needCash ? amount : 0,
+        };
       });
 
       if (result.wrong) {
         return send(res, 400, false, `OTP galat hai. ${result.left} try baaki.`);
+      }
+      if (result.done) {
+        const paid = result.amount ? ` • ₹${result.amount} cash` : '';
+        await safe(() => sendToUsers([result.customerId], {
+          type: 'DELIVERED',
+          bookingId,
+          dedupeKey: `DELIVERED_${bookingId}`,
+          title: 'Cylinder delivered ✅',
+          body: result.amount ? `Thank you! ₹${result.amount} paid in cash.` : 'Thank you!',
+        }));
+        await safe(async () => sendToUsers(await ownerUids(), {
+          type: 'DELIVERED',
+          bookingId,
+          dedupeKey: `DELIVERED_${bookingId}_owner`,
+          title: 'Delivery complete ✅',
+          body: `${result.agentName} → ${result.customerName}${paid}`,
+        }));
       }
       return send(res, 200, true,
         result.already ? 'Order pehle hi deliver ho chuka hai.' : 'Delivery complete! ✅');
