@@ -72,7 +72,7 @@ module.exports = async (req, res) => {
     return send(res, e.status || 401, false, e.message);
   }
 
-  const { action, bookingId, otp } = parseBody(req);
+  const { action, bookingId, otp, cashAmount } = parseBody(req);
   if (!bookingId || typeof bookingId !== 'string') {
     return send(res, 400, false, 'bookingId required.');
   }
@@ -128,12 +128,15 @@ module.exports = async (req, res) => {
       if (!/^\d{4}$/.test(entered)) return send(res, 400, false, '4-digit OTP daalo.');
 
       const cylRef = db.collection('inventory').doc('cylinder');
+      const pricesRef = db.collection('settings').doc('prices');
+      const paymentRef = db.collection('payments').doc(`pay_${bookingId}`);
 
       const result = await db.runTransaction(async (tx) => {
         // Saare reads pehle
         const bSnap = await tx.get(bookingRef);
         const oSnap = await tx.get(otpRef);
         const cSnap = await tx.get(cylRef);
+        const pSnap = await tx.get(pricesRef);
 
         if (!bSnap.exists) throw httpError(404, 'Order nahi mila.');
         const b = bSnap.data();
@@ -154,6 +157,35 @@ module.exports = async (req, res) => {
         if (o.otp !== entered) {
           tx.update(otpRef, { attempts: attempts + 1 });
           return { wrong: true, left: MAX_ATTEMPTS - attempts - 1 };
+        }
+
+        // ---- Payment (COD): agent ka amount order se match hona chahiye ----
+        const qtyP = Math.max(1, parseInt(b.quantity, 10) || 1);
+        const priceMap = (pSnap.exists && pSnap.data().prices) || {};
+        const unit = Number(b.unitPrice) > 0
+          ? Number(b.unitPrice)
+          : (Number(priceMap[b.cylinderType]) || 0);
+        const amount = Number(b.totalAmount) > 0 ? Number(b.totalAmount) : unit * qtyP;
+        const method = b.paymentMethod || 'COD';
+        const alreadyPaid = ['CASH_COLLECTED', 'ONLINE_PAID'].includes(b.paymentStatus);
+        const needCash = method === 'COD' && !alreadyPaid;
+        const paymentUpdate = {};
+        if (needCash) {
+          if (!(amount > 0)) {
+            throw httpError(400, 'Is order ka amount set nahi hai. Owner se Cylinder Prices check karwao.');
+          }
+          if (Number(cashAmount) !== amount) {
+            throw httpError(400, `Amount match nahi hua. Is order ka amount ₹${amount} hai.`);
+          }
+          Object.assign(paymentUpdate, {
+            unitPrice: unit,
+            totalAmount: amount,
+            paymentMethod: 'COD',
+            paymentStatus: 'CASH_COLLECTED',
+            paidAmount: amount,
+            paymentCollectedAt: FieldValue.serverTimestamp(),
+            paymentCollectedBy: agent.agentId || '',
+          });
         }
 
         // ---- Inventory (sirf agar approve par nahi kata tha) ----
@@ -197,9 +229,28 @@ module.exports = async (req, res) => {
           statusChangedAt: FieldValue.serverTimestamp(),
           updatedAt: FieldValue.serverTimestamp(),
           ...bookingExtra,
+          ...paymentUpdate,
         });
 
         tx.delete(otpRef);
+
+        if (needCash) {
+          tx.set(paymentRef, {
+            paymentId: paymentRef.id,
+            orderId: bookingId,
+            customerId: b.customerId || '',
+            agencyId: AGENCY_ID,
+            agentId: agent.agentId || '',
+            agentUid: agent.uid,
+            amount,
+            paymentMethod: 'COD',
+            paymentStatus: 'CASH_COLLECTED',
+            transactionId: null,
+            collectedAt: FieldValue.serverTimestamp(),
+            createdAt: FieldValue.serverTimestamp(),
+            updatedAt: FieldValue.serverTimestamp(),
+          });
+        }
 
         const customerName = String(b.customerName || 'Customer').trim();
         const consumerNo = String(b.consumerNumber || '').trim();
