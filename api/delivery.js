@@ -238,6 +238,8 @@ module.exports = async (req, res) => {
           tx.set(paymentRef, {
             paymentId: paymentRef.id,
             orderId: bookingId,
+            customerName: String(b.customerName || '').trim(),
+            settled: false,
             customerId: b.customerId || '',
             agencyId: AGENCY_ID,
             agentId: agent.agentId || '',
