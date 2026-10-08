@@ -65,13 +65,14 @@ module.exports = async (req, res) => {
       throw e;
     }
 
-    await admin.auth().setCustomUserClaims(user.uid, { role: 'customer' });
+    await admin.auth().setCustomUserClaims(user.uid, { role: 'customer', agencyId: 'sumitra-rasalpur' });
 
     const FieldValue = admin.firestore.FieldValue;
     await admin.firestore().collection('customers').doc(user.uid).set({
       uid: user.uid,
       name: cleanName,
       mobile,
+      agencyId: 'sumitra-rasalpur',
       verificationStatus: 'pending',
       consumerNumber: null,
       active: true,
