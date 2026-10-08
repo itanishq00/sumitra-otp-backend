@@ -9,7 +9,9 @@ async function ownerUids(agencyId) {
   const snap = await admin.firestore().collection('admins')
     .where('agencyId', '==', agencyId || AGENCY_ID)
     .get();
-  return snap.docs.map((d) => d.id);
+  return snap.docs
+    .filter((d) => String((d.data() || {}).status || 'ACTIVE').toUpperCase() === 'ACTIVE')
+    .map((d) => d.id);
 }
 
 // Har recipient ke liye notifications/{dedupeKey}_{uid} banata hai.

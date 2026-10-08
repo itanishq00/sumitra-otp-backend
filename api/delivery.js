@@ -127,7 +127,7 @@ module.exports = async (req, res) => {
       const entered = String(otp || '');
       if (!/^\d{4}$/.test(entered)) return send(res, 400, false, '4-digit OTP daalo.');
 
-      const cylRef = db.collection('inventory').doc('cylinder');
+      let cylRef = db.collection('inventory').doc(`${AGENCY_ID}__cylinder`);
       const pricesRef = db.collection('settings').doc('prices');
       const paymentRef = db.collection('payments').doc(`pay_${bookingId}`);
 
@@ -135,8 +135,12 @@ module.exports = async (req, res) => {
         // Saare reads pehle
         const bSnap = await tx.get(bookingRef);
         const oSnap = await tx.get(otpRef);
+        // Agency ke hisaab se inventory aur prices (multi-agency).
+        const bAgency = (bSnap.exists && bSnap.data().agencyId) || AGENCY_ID;
+        cylRef = db.collection('inventory').doc(`${bAgency}__cylinder`);
         const cSnap = await tx.get(cylRef);
-        const pSnap = await tx.get(pricesRef);
+        let pSnap = await tx.get(db.collection('settings').doc(`${bAgency}__prices`));
+        if (!pSnap.exists && bAgency === AGENCY_ID) pSnap = await tx.get(pricesRef);
 
         if (!bSnap.exists) throw httpError(404, 'Order nahi mila.');
         const b = bSnap.data();
