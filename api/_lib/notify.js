@@ -3,7 +3,13 @@ const { AGENCY_ID } = require('./auth');
 
 // Sirf ye notifications bheje jaate hain. Aur chahiye to yahan naam jodo,
 // jaise 'AGENT_ASSIGNED', 'OUT_FOR_DELIVERY', 'DELIVERED'.
-const ENABLED_TYPES = new Set(['COMPLAINT_CREATED']);
+const ENABLED_TYPES = new Set([
+  'BOOKING_CREATED', 'BOOKING_APPROVED', 'BOOKING_REJECTED',
+  'AGENT_ASSIGNED', 'AGENT_ACCEPTED', 'AGENT_REJECTED',
+  'OUT_FOR_DELIVERY', 'ARRIVED', 'DELIVERY_FAILED', 'DELIVERED',
+  'DELIVERY_OTP', 'OTP_LOCKED', 'CUSTOMER_APPROVED',
+  'COMPLAINT_CREATED', 'COMPLAINT_RESOLVED',
+]);
 
 async function ownerUids(agencyId) {
   const snap = await admin.firestore().collection('admins')
@@ -16,7 +22,7 @@ async function ownerUids(agencyId) {
 
 // Har recipient ke liye notifications/{dedupeKey}_{uid} banata hai.
 // Doc pehle se ho (retry) to dobara push nahi bhejta.
-async function sendToUsers(uids, { type, title, body, bookingId = null, complaintId = null, dedupeKey }) {
+async function sendToUsers(uids, { type, title, body, bookingId = null, complaintId = null, dedupeKey, agencyId = null }) {
   const db = admin.firestore();
   const FieldValue = admin.firestore.FieldValue;
   if (!ENABLED_TYPES.has(type)) return { sent: 0, disabled: true };
@@ -31,7 +37,7 @@ async function sendToUsers(uids, { type, title, body, bookingId = null, complain
       await ref.create({
         notificationId: id,
         recipientId: uid,
-        agencyId: AGENCY_ID,
+        agencyId: agencyId || AGENCY_ID,
         type,
         title,
         body,

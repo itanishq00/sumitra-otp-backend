@@ -120,8 +120,7 @@ module.exports = async (req, res) => {
 
           return res.status(400).json({
             success: false,
-            message: result.message || "Invalid OTP.",
-            details: result
+            message: result.message || "Invalid OTP."
           });
         } catch (error) {
           console.error("Message Central verify response error:", error);

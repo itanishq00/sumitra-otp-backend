@@ -1,5 +1,5 @@
 const admin = require('./_lib/firebase');
-const { cors, httpError } = require('./_lib/auth');
+const { AGENCY_ID, cors, httpError } = require('./_lib/auth');
 const { ownerUids, sendToUsers } = require('./_lib/notify');
 
 const FAIL = ['CUSTOMER_NOT_AVAILABLE', 'WRONG_ADDRESS', 'DELIVERY_FAILED', 'PAYMENT_FAILED'];
@@ -59,8 +59,20 @@ module.exports = async (req, res) => {
   }
 
   const db = admin.firestore();
-  const isOwner = async () => user.role === 'owner'
-    || (await db.collection('admins').doc(user.uid).get()).exists;
+  // C3: owner sirf APNI agency ka event bhej sakta hai, aur ACTIVE hona chahiye.
+  const ownerAgency = async () => {
+    const a = await db.collection('admins').doc(user.uid).get();
+    if (a.exists) {
+      const d = a.data() || {};
+      if (String(d.status || 'ACTIVE').toUpperCase() !== 'ACTIVE') return null;
+      return String(d.agencyId || user.agencyId || AGENCY_ID);
+    }
+    return user.role === 'owner' ? String(user.agencyId || AGENCY_ID) : null;
+  };
+  const isOwner = async (agencyId) => {
+    const mine = await ownerAgency();
+    return !!mine && mine === String(agencyId || AGENCY_ID);
+  };
   const isAgent = user.role === 'delivery_agent';
   const deny = () => send(res, 403, false, 'Not allowed.');
   const done = (r) => send(res, 200, true, 'ok', { sent: r ? r.sent : 0 });
@@ -72,7 +84,7 @@ module.exports = async (req, res) => {
       if (!snap.exists) return send(res, 404, false, 'Booking nahi mili.');
       const b = snap.data();
       const key = `${event}_${refId}_${mark(b.updatedAt)}`;
-      const base = { type: event, bookingId: refId, dedupeKey: key };
+      const base = { type: event, agencyId: b.agencyId || null, bookingId: refId, dedupeKey: key };
       const cname = b.customerName || 'Customer';
 
       if (event === 'BOOKING_CREATED') {
@@ -84,7 +96,7 @@ module.exports = async (req, res) => {
       }
 
       if (event === 'BOOKING_APPROVED') {
-        if (!(await isOwner())) return deny();
+        if (!(await isOwner(b.agencyId))) return deny();
         return done(await sendToUsers([b.customerId], {
           ...base, title: 'Booking confirmed ✅',
           body: `Your ${b.cylinderType || ''} cylinder booking is confirmed.`,
@@ -92,7 +104,7 @@ module.exports = async (req, res) => {
       }
 
       if (event === 'BOOKING_REJECTED') {
-        if (!(await isOwner())) return deny();
+        if (!(await isOwner(b.agencyId))) return deny();
         return done(await sendToUsers([b.customerId], {
           ...base, title: 'Booking cancelled',
           body: b.ownerNote ? `Reason: ${b.ownerNote}` : 'Your booking was cancelled by the agency.',
@@ -100,7 +112,7 @@ module.exports = async (req, res) => {
       }
 
       if (event === 'AGENT_ASSIGNED') {
-        if (!(await isOwner())) return deny();
+        if (!(await isOwner(b.agencyId))) return deny();
         await sendToUsers([b.agentUid], {
           ...base, dedupeKey: `${key}_agent`,
           title: 'Nayi delivery assign hui 🚚', body: `${cname} • ${label(b)}`,
@@ -166,11 +178,11 @@ module.exports = async (req, res) => {
 
     // ---------------- CUSTOMER ACCOUNT ----------------
     if (event === 'CUSTOMER_APPROVED') {
-      if (!(await isOwner())) return deny();
       const c = await db.collection('customers').doc(refId).get();
       if (!c.exists || c.data().verificationStatus !== 'verified') return deny();
+      if (!(await isOwner(c.data().agencyId))) return deny();
       return done(await sendToUsers([refId], {
-        type: event, dedupeKey: `${event}_${refId}`,
+        type: event, agencyId: c.data().agencyId || null, dedupeKey: `${event}_${refId}`,
         title: 'Account approved ✅',
         body: `Your consumer number is ${c.data().consumerNumber || ''}. You can now book your cylinder.`,
       }));
@@ -185,7 +197,7 @@ module.exports = async (req, res) => {
       if (event === 'COMPLAINT_CREATED') {
         if (d.customerId !== user.uid) return deny();
         return done(await sendToUsers(await ownerUids(d.agencyId), {
-          type: event, complaintId: refId, dedupeKey: `${event}_${refId}`,
+          type: event, agencyId: d.agencyId || null, complaintId: refId, dedupeKey: `${event}_${refId}`,
           title: (d.isSafety || d.category === 'Leakage/safety')
             ? '🚨 GAS LEAKAGE / Safety complaint'
             : d.priority === 'Urgent' ? '🚨 Urgent complaint' : 'Nayi complaint',
@@ -193,10 +205,10 @@ module.exports = async (req, res) => {
         }));
       }
 
-      if (!(await isOwner())) return deny();
+      if (!(await isOwner(d.agencyId))) return deny();
       if (d.status !== 'Resolved') return deny();
       return done(await sendToUsers([d.customerId], {
-        type: event, complaintId: refId, dedupeKey: `${event}_${refId}_${mark(d.resolvedAt)}`,
+        type: event, agencyId: d.agencyId || null, complaintId: refId, dedupeKey: `${event}_${refId}_${mark(d.resolvedAt)}`,
         title: 'Complaint resolved ✅', body: `"${d.title || 'Your complaint'}" has been resolved.`,
       }));
     }

@@ -5,6 +5,8 @@ const { ownerUids, sendToUsers, safe } = require('./_lib/notify');
 
 const OTP_TTL_MS = 30 * 60 * 1000; // 30 minute
 const MAX_ATTEMPTS = 5;
+const MAX_REGENERATE = 3; // 1 ghante me pehle OTP ke baad max 3 naye OTP
+const LOCK_MS = 60 * 60 * 1000; // uske baad 1 ghanta lock
 
 function send(res, status, success, message, extra = {}) {
   return res.status(status).json({ success, message, ...extra });
@@ -94,11 +96,27 @@ module.exports = async (req, res) => {
 
       // Valid OTP pehle se hai to wahi rakho (retry-safe).
       const existing = await otpRef.get();
+      let regenerateCount = 0;
       if (existing.exists) {
         const e = existing.data();
         if ((e.expiresAtMs || 0) > Date.now() && (e.attempts || 0) < MAX_ATTEMPTS) {
           return send(res, 200, true, 'OTP customer ke app me dikh raha hai. Customer se poochho.');
         }
+        // B4: brute-force rok. 1 ghante me MAX_REGENERATE se zyada naye OTP nahi.
+        const recent = Date.now() - (e.sentAtMs || 0) < LOCK_MS;
+        const prev = e.regenerateCount || 0;
+        if (recent && prev >= MAX_REGENERATE) {
+          await safe(async () => sendToUsers(await ownerUids(b.agencyId), {
+            type: 'OTP_LOCKED',
+            agencyId: b.agencyId || null,
+            bookingId,
+            dedupeKey: `OTP_LOCKED_${bookingId}_${e.sentAtMs || 0}`,
+            title: '⚠️ Delivery OTP lock',
+            body: `${b.customerName || 'Customer'} ki delivery ka OTP baar-baar fail hua. Check karo.`,
+          }));
+          return send(res, 429, false, 'OTP ki limit khatam. 1 ghante baad try karo ya owner se baat karo.');
+        }
+        regenerateCount = recent ? prev + 1 : 0;
       }
 
       const code = String(crypto.randomInt(0, 10000)).padStart(4, '0');
@@ -110,10 +128,13 @@ module.exports = async (req, res) => {
         otp: code,
         attempts: 0,
         expiresAtMs: Date.now() + OTP_TTL_MS,
+        regenerateCount,
+        sentAtMs: Date.now(),
         createdAt: FieldValue.serverTimestamp(),
       });
       await safe(() => sendToUsers([b.customerId], {
         type: 'DELIVERY_OTP',
+        agencyId: b.agencyId || null,
         bookingId,
         dedupeKey: `OTP_${bookingId}_${code}`,
         title: 'Your delivery OTP is ready',
@@ -311,6 +332,7 @@ module.exports = async (req, res) => {
         const paid = result.amount ? ` • ₹${result.amount} cash` : '';
         await safe(() => sendToUsers([result.customerId], {
           type: 'DELIVERED',
+          agencyId: result.agencyId || null,
           bookingId,
           dedupeKey: `DELIVERED_${bookingId}`,
           title: 'Cylinder delivered ✅',
@@ -318,6 +340,7 @@ module.exports = async (req, res) => {
         }));
         await safe(async () => sendToUsers(await ownerUids(result.agencyId), {
           type: 'DELIVERED',
+          agencyId: result.agencyId || null,
           bookingId,
           dedupeKey: `DELIVERED_${bookingId}_owner`,
           title: 'Delivery complete ✅',
