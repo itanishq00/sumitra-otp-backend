@@ -1,9 +1,12 @@
-// Customer password reset: OTP (same send-otp/verify-otp as signup) -> naya password.
-// Sirf customer accounts. Owner / agent / HP admin ka password yahan se nahi badlega.
+// Password reset via OTP (same send-otp/verify-otp as signup).
+// accountType: 'customer' (default) ya 'agent'. Owner / HP admin ka password yahan se KABHI nahi badlega.
 const admin = require('./_lib/firebase');
 const verifyOtp = require('./verify-otp');
 
-const BLOCKED_ROLES = ['owner', 'hp_admin', 'delivery_agent', 'agent'];
+const TYPES = {
+  customer: { coll: 'customers', uidOf: (d) => d.id, blocked: ['owner', 'hp_admin', 'delivery_agent', 'agent'], who: 'customer' },
+  agent: { coll: 'deliveryAgents', uidOf: (d) => String(d.get('authUid') || ''), blocked: ['owner', 'hp_admin'], who: 'delivery agent' },
+};
 
 function callHandler(handler, body) {
   return new Promise((resolve) => {
@@ -20,30 +23,32 @@ function callHandler(handler, body) {
   });
 }
 
-function validate(mobile, newPassword) {
+function validate(mobile, newPassword, accountType) {
+  if (!TYPES[accountType]) return 'Galat account type.';
   if (!/^\d{10}$/.test(mobile)) return 'Sahi 10-digit mobile number daalo.';
   if (typeof newPassword !== 'string' || newPassword.length < 6 || newPassword.length > 64) return 'Password kam se kam 6 akshar ka hona chahiye.';
   return null;
 }
 
-async function resetPasswordCore({ mobile, newPassword }) {
-  const bad = validate(mobile, newPassword);
+async function resetPasswordCore({ mobile, newPassword, accountType = 'customer' }) {
+  const bad = validate(mobile, newPassword, accountType);
   if (bad) return { code: 400, message: bad };
+  const t = TYPES[accountType];
   const db = admin.firestore();
-  const snap = await db.collection('customers').where('mobile', '==', mobile).limit(5).get();
-  const uids = [...new Set(snap.docs.map((d) => d.id))];
-  if (uids.length === 0) return { code: 404, message: 'Is mobile number par koi customer account nahi mila.' };
+  const snap = await db.collection(t.coll).where('mobile', '==', mobile).limit(5).get();
+  const uids = [...new Set(snap.docs.map(t.uidOf).filter(Boolean))];
+  if (uids.length === 0) return { code: 404, message: `Is mobile number par koi ${t.who} account nahi mila.` };
   if (uids.length > 1) return { code: 409, message: 'Is number par ek se zyada account hain. Agency se sampark karo.' };
   let user;
-  try { user = await admin.auth().getUser(uids[0]); } catch (_) { return { code: 404, message: 'Is mobile number par koi customer account nahi mila.' }; }
+  try { user = await admin.auth().getUser(uids[0]); } catch (_) { return { code: 404, message: `Is mobile number par koi ${t.who} account nahi mila.` }; }
   const role = (user.customClaims || {}).role;
-  if (role && BLOCKED_ROLES.includes(role)) return { code: 403, message: 'Ye customer account nahi hai.' };
+  if (role && t.blocked.includes(role)) return { code: 403, message: `Ye ${t.who} account nahi hai.` };
   await admin.auth().updateUser(user.uid, { password: newPassword });
   try { await admin.auth().revokeRefreshTokens(user.uid); } catch (_) {}
   try {
     await db.collection('auditLogs').add({
-      agencyId: snap.docs[0].get('agencyId') || 'platform', actorId: user.uid, actorEmail: '', actorRole: 'customer',
-      action: 'CUSTOMER_PASSWORD_RESET', targetType: 'customer', targetId: user.uid,
+      agencyId: snap.docs[0].get('agencyId') || 'platform', actorId: user.uid, actorEmail: '', actorRole: accountType,
+      action: 'PASSWORD_RESET_OTP', targetType: accountType, targetId: user.uid,
       oldValue: null, newValue: { via: 'otp' }, timestamp: admin.firestore.FieldValue.serverTimestamp(),
     });
   } catch (_) {}
@@ -56,14 +61,15 @@ module.exports = async (req, res) => {
   try {
     const b = req.body || {};
     const mobile = String(b.mobileNumber || '').replace(/\D/g, '').slice(-10);
-    const bad = validate(mobile, b.newPassword);
+    const accountType = String(b.accountType || 'customer');
+    const bad = validate(mobile, b.newPassword, accountType);
     if (bad) return res.status(400).json({ success: false, message: bad });
     if (!b.otp || !b.verificationId) return res.status(400).json({ success: false, message: 'OTP daalo.' });
     const v = await callHandler(verifyOtp, { mobileNumber: mobile, otp: String(b.otp), verificationId: String(b.verificationId) });
     if (v.code !== 200 || !v.body || v.body.success !== true) {
       return res.status(400).json({ success: false, message: (v.body && v.body.message) || 'OTP galat ya expire ho gaya.' });
     }
-    const r = await resetPasswordCore({ mobile, newPassword: b.newPassword });
+    const r = await resetPasswordCore({ mobile, newPassword: b.newPassword, accountType });
     return res.status(r.code).json({ success: r.code === 200, message: r.message });
   } catch (e) {
     console.error('reset-password error:', e);
