@@ -135,7 +135,24 @@ async function cashList(dec, b) {
   return { date, deposits: s.docs.map((d) => ({ id: d.id, agentId: d.get('agentId'), agentName: d.get('agentName'), amount: d.get('amount'), note: d.get('note') || '', at: ms(d.get('createdAt')) })) };
 }
 
-const ACTIONS = { 'cancel-booking': cancelBooking, 'set-slot': setSlot, 'service-request': serviceRequest, 'owner-booking': ownerBooking, 'cash-add': cashAdd, 'cash-list': cashList };
+
+async function deleteAccount(dec) {
+  const cref = db().doc(`customers/${dec.uid}`); const c = await cref.get();
+  if (!c.exists) throw new HttpError(404, 'Customer account nahi mila.');
+  if (dec.role && dec.role !== 'customer') throw new HttpError(403, 'Ye customer account nahi hai.');
+  const hist = await db().collection('bookings').where('customerId', '==', dec.uid).get();
+  if (hist.docs.some(isActive)) throw new HttpError(409, 'Aapki ek booking chal rahi hai. Pehle use poora ya cancel karo.');
+  await cref.set({
+    deleted: true, deletedAt: FV().serverTimestamp(), active: false, verificationStatus: 'deleted', name: 'Deleted user',
+    mobile: FV().delete(), email: FV().delete(), updatedAt: FV().serverTimestamp(),
+  }, { merge: true });
+  await safe(() => db().collection('fcmTokens').doc(dec.uid).delete());
+  await audit(c.get('agencyId'), dec.uid, 'customer', 'ACCOUNT_DELETED', 'customer', dec.uid);
+  await admin.auth().deleteUser(dec.uid);
+  return { message: 'Account delete ho gaya.' };
+}
+
+const ACTIONS = { 'delete-account': deleteAccount, 'cancel-booking': cancelBooking, 'set-slot': setSlot, 'service-request': serviceRequest, 'owner-booking': ownerBooking, 'cash-add': cashAdd, 'cash-list': cashList };
 
 module.exports = async (req, res) => {
   if (req.method === 'GET') return res.status(200).json({ success: true, message: 'ops ready' });
