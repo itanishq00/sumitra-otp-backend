@@ -1,6 +1,7 @@
 // Roz Vercel cron se: 48 ghante+ khuli complaints -> escalate + owner ko notification.
 const admin = require('./_lib/firebase');
 const { sendToUsers, ownerUids } = require('./_lib/notify');
+const { Timestamp } = require('firebase-admin/firestore');
 
 const HOURS = 48;
 const ACTIVE = ['Open', 'In Progress'];
@@ -51,14 +52,49 @@ async function runEscalation({ dry = false, now = Date.now() } = {}) {
   return { open: snap.size, due: due.length, notified, dry };
 }
 
+
+const GAP_DAYS = 45;
+// 45 din poore hone par customer ko "agli booking" reminder (ek booking par ek hi baar).
+async function runReminders({ dry = false, now = Date.now() } = {}) {
+  const db = admin.firestore();
+  const FV = admin.firestore.FieldValue;
+  const cutoff = Timestamp.fromMillis(now - GAP_DAYS * 86400e3);
+  const snap = await db.collection('customers').where('lastBookingAt', '<=', cutoff).limit(500).get();
+  const due = [];
+  for (const d of snap.docs) {
+    const bid = d.get('lastBookingId');
+    if (!bid || d.get('reminderSentFor') === bid || d.get('verificationStatus') === 'rejected') continue;
+    const bk = await db.doc(`bookings/${bid}`).get();
+    if (bk.exists && ['Pending', 'Approved', 'Partially Confirmed'].includes(bk.get('status')) && bk.get('orderStatus') !== 'DELIVERED') continue;
+    due.push(d);
+  }
+  let sent = 0;
+  if (!dry) {
+    for (const d of due) {
+      try {
+        await sendToUsers([d.id], {
+          type: 'BOOKING_REMINDER', agencyId: d.get('agencyId') || null, dedupeKey: `BOOKING_REMINDER_${d.get('lastBookingId')}`,
+          title: '🔔 Agli booking ka samay', body: `${GAP_DAYS} din poore ho gaye. Ab aap naya cylinder book kar sakte ho.`,
+        });
+        sent++;
+      } catch (e) { console.error('reminder:', e.message); }
+      await d.ref.update({ reminderSentFor: d.get('lastBookingId'), reminderSentAt: FV.serverTimestamp() });
+    }
+  }
+  return { due: due.length, sent, ids: due.map((d) => d.id) };
+}
+
 module.exports = async (req, res) => {
   if (!authorized(req)) return res.status(401).json({ success: false, message: 'Unauthorized' });
   try {
     const dry = String((req.query && req.query.dry) || '') === '1';
-    return res.status(200).json({ success: true, ...(await runEscalation({ dry })) });
+    const esc = await runEscalation({ dry });
+    const rem = await runReminders({ dry });
+    return res.status(200).json({ success: true, ...esc, reminders: { due: rem.due, sent: rem.sent } });
   } catch (e) {
     console.error('escalate error:', e);
     return res.status(500).json({ success: false, message: 'Server error' });
   }
 };
 module.exports.runEscalation = runEscalation;
+module.exports.runReminders = runReminders;
