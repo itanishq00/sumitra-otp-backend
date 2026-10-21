@@ -154,8 +154,26 @@ async function deleteAccount(dec) {
 
 const ACTIONS = { 'delete-account': deleteAccount, 'cancel-booking': cancelBooking, 'set-slot': setSlot, 'service-request': serviceRequest, 'owner-booking': ownerBooking, 'cash-add': cashAdd, 'cash-list': cashList };
 
+
+const DEFAULT_FLAGS = { onlinePayment: false, kyc: false };
+// Public app config (force-update minBuild + feature flags). Firestore doc: config/app
+async function appConfig(res) {
+  res.setHeader('Cache-Control', 'public, max-age=300');
+  try {
+    const s = await db().doc('config/app').get();
+    const d = s.exists ? s.data() : {};
+    return res.status(200).json({ success: true, apps: d.apps || {}, flags: { ...DEFAULT_FLAGS, ...(d.flags || {}) }, notice: String(d.notice || '') });
+  } catch (e) {
+    console.error('app-config:', e.message);
+    return res.status(200).json({ success: true, apps: {}, flags: DEFAULT_FLAGS, notice: '' });
+  }
+}
+
 module.exports = async (req, res) => {
-  if (req.method === 'GET') return res.status(200).json({ success: true, message: 'ops ready' });
+  if (req.method === 'GET') {
+    if (req.query && String(req.query.config || '') === '1') return appConfig(res);
+    return res.status(200).json({ success: true, message: 'ops ready' });
+  }
   if (req.method !== 'POST') return res.status(405).json({ success: false, message: 'Method not allowed' });
   try {
     const b = req.body || {};

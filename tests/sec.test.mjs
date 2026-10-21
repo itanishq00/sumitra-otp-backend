@@ -8,7 +8,6 @@ const { privateKey } = crypto.generateKeyPairSync('rsa', { modulusLength: 2048, 
 Object.assign(process.env, { FIREBASE_PROJECT_ID: 'demo-gas-test', GCLOUD_PROJECT: 'demo-gas-test', FIREBASE_CLIENT_EMAIL: 'tester@demo-gas-test.iam.gserviceaccount.com', FIREBASE_PRIVATE_KEY: privateKey });
 const require = createRequire(import.meta.url);
 const admin = require('../api/_lib/firebase');
-const cfg = require('../api/app-config.js');
 const HAS_OPS = fs.existsSync(new URL('../api/ops.js', import.meta.url)) && fs.readFileSync(new URL('../api/ops.js', import.meta.url), 'utf8').includes('delete-account');
 const db = admin.firestore();
 const mk = () => ({ code: 0, body: null, setHeader() { return this; }, status(c) { this.code = c; return this; }, json(b) { this.body = b; return this; } });
@@ -27,7 +26,7 @@ before(async () => {
   for (const u of ['sdel1', 'sdel2']) tok[u] = await signIn(`${u}@test.local`);
 });
 test('A1 app-config default (koi block nahi)', async () => {
-  const r = mk(); await cfg({ method: 'GET', headers: {}, query: {} }, r);
+  const r = mk(); await require('../api/ops.js')({ method: 'GET', headers: {}, query: { config: '1' } }, r);
   assert.equal(r.code, 200); assert.equal(r.body.success, true); assert.equal(r.body.flags.onlinePayment, false);
 });
 test('D1 chalti booking ho to delete mana', { skip: !HAS_OPS }, async () => {
