@@ -3,6 +3,7 @@ const admin = require('./_lib/firebase');
 const { sendToUsers, ownerUids } = require('./_lib/notify');
 const { Timestamp } = require('firebase-admin/firestore');
 const { runSettlements, runPendingReminders } = require('./_lib/emergency');
+const { runDutyCleanup } = require('./_lib/duty');
 
 const HOURS = 48;
 const ACTIVE = ['Open', 'In Progress'];
@@ -92,8 +93,9 @@ module.exports = async (req, res) => {
     const esc = await runEscalation({ dry });
     let emg = { due: 0, created: 0 }; let pend = { pending: 0, reminded: 0, escalated: 0 };
     try { emg = await runSettlements({ dry }); pend = await runPendingReminders({ dry }); } catch (e) { console.error('emergency cron:', e.message); }
+    let duty = { old: 0 }; try { duty = await runDutyCleanup({ dry }); } catch (e) { console.error('duty cleanup:', e.message); }
     const rem = await runReminders({ dry });
-    return res.status(200).json({ success: true, ...esc, reminders: { due: rem.due, sent: rem.sent }, emergency: { ...emg, ...pend } });
+    return res.status(200).json({ success: true, ...esc, reminders: { due: rem.due, sent: rem.sent }, emergency: { ...emg, ...pend }, duty });
   } catch (e) {
     console.error('escalate error:', e);
     return res.status(500).json({ success: false, message: 'Server error' });

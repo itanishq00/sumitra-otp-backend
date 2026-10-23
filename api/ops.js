@@ -173,6 +173,9 @@ async function emergencyHandover(dec, b) {
   const id = String(b.bookingId || '');
   if (!id) throw new HttpError(400, 'bookingId chahiye.');
   const bref = db().doc(`bookings/${id}`);
+  const adm = await db().doc(`admins/${dec.uid}`).get();
+  const byName = String((adm.exists && (adm.get('name') || adm.get('ownerName'))) || dec.name || '').trim();
+  const byEmail = String(dec.email || dec.phone_number || '').trim();
   const out = await db().runTransaction(async (tx) => {
     const s = await tx.get(bref);
     if (!s.exists || s.get('agencyId') !== agencyId) throw new HttpError(404, 'Booking aapki agency me nahi mili.');
@@ -206,7 +209,7 @@ async function emergencyHandover(dec, b) {
       paidAmount: amount, paymentCollectedAt: FV().serverTimestamp(), paymentCollectedBy: x.agentId || '' });
     const dueAtMs = Number(x.emergencyDueAtMs) || Date.now() + GAP_DAYS * 86400e3;
     tx.update(bref, { orderStatus: 'DELIVERED', status: 'Delivered', pendingQuantity: 0, deliveredAt: FV().serverTimestamp(), deliveredBy: x.agentId || '',
-      verificationMethod: 'OWNER_EMERGENCY', verificationStatus: 'PENDING_OTP', handoverBy: dec.uid,
+      verificationMethod: 'OWNER_EMERGENCY', verificationStatus: 'PENDING_OTP', handoverBy: dec.uid, handoverByName: byName, handoverByEmail: byEmail,
       statusChangedAt: FV().serverTimestamp(), updatedAt: FV().serverTimestamp(), ...upd });
     tx.delete(db().doc(`deliveryOtps/${id}`));
     if (needCash) tx.set(db().doc(`payments/pay_${id}`), { paymentId: `pay_${id}`, orderId: id, customerName: String(x.customerName || '').trim(), settled: false,
@@ -215,6 +218,8 @@ async function emergencyHandover(dec, b) {
     tx.set(db().doc(`${PENDING}/${id}`), { agencyId, customerId: x.customerId, customerName: x.customerName || 'Customer', customerMobile: x.customerMobile || '',
       consumerNumber: x.consumerNumber || null, cylinderType: x.cylinderType || '', emergencyBookingId: id, reason: x.emergencyReason || '',
       amount: needCash ? amount : 0, agentUid: x.agentUid, status: 'WAITING', dueAtMs, deliveredAtMs: Date.now(), handoverBy: dec.uid,
+      handoverByName: byName, handoverByEmail: byEmail, handoverAtMs: Date.now(), requestedAtMs: Number(x.handoverRequestedAtMs) || null,
+      requestedByName: x.handoverRequestedByName || null, agentName: x.agentName || x.handoverRequestedByName || null,
       createdAt: FV().serverTimestamp(), updatedAt: FV().serverTimestamp() });
     tx.set(cref, { emergencyPendingId: id, updatedAt: FV().serverTimestamp() }, { merge: true });
     tx.set(db().collection('inventoryActivity').doc(), { agencyId, action: 'Emergency Cylinder Delivered', section: 'Cylinder', item: `${size || ''} kg Cylinder`,
@@ -268,7 +273,7 @@ async function pendingOtpSettle(dec, b) {
       verifiedAt: FV().serverTimestamp(), deliveredAt: FV().serverTimestamp(), statusChangedAt: FV().serverTimestamp(), updatedAt: FV().serverTimestamp() });
     tx.update(db().doc(`bookings/${id}`), { verificationStatus: 'VERIFIED', settledBy: sid, verifiedAt: FV().serverTimestamp(), updatedAt: FV().serverTimestamp() });
     tx.delete(oref);
-    tx.update(pref, { status: 'SETTLED', locked: false, settledAt: FV().serverTimestamp(), settledBy: dec.uid, updatedAt: FV().serverTimestamp() });
+    tx.update(pref, { status: 'SETTLED', locked: false, settledAt: FV().serverTimestamp(), settledAtMs: Date.now(), settledBy: dec.uid, settledByEmail: String(dec.email || dec.phone_number || ''), updatedAt: FV().serverTimestamp() });
     tx.set(db().doc(`customers/${p.get('customerId')}`), { emergencyPendingId: FV().delete(), updatedAt: FV().serverTimestamp() }, { merge: true });
     return { done: true, customerId: p.get('customerId') };
   });
@@ -301,7 +306,37 @@ async function pendingOtpResend(dec, b) {
   return { message: 'Customer ko naya OTP bhej diya.' };
 }
 
-const ACTIONS = { 'delete-account': deleteAccount, 'cancel-booking': cancelBooking, 'set-slot': setSlot, 'service-request': serviceRequest, 'owner-booking': ownerBooking, 'cash-add': cashAdd, 'cash-list': cashList, 'emergency-handover': emergencyHandover, 'pending-otp-list': pendingOtpList, 'pending-otp-settle': pendingOtpSettle, 'pending-otp-resend': pendingOtpResend };
+// ---------- Emergency history + Duty logs (owner, 6 mahine) ----------
+const SIX_MONTHS = 183 * 86400e3;
+
+async function emergencyHistory(dec) {
+  const agencyId = await ownerAgency(dec);
+  const cutoff = Date.now() - SIX_MONTHS;
+  const s = await db().collection(PENDING).where('agencyId', '==', agencyId).get();
+  const items = s.docs.map((d) => ({
+    id: d.id, customerName: d.get('customerName') || 'Customer', customerMobile: d.get('customerMobile') || '',
+    cylinderType: d.get('cylinderType') || '', reason: d.get('reason') || '', amount: d.get('amount') || 0, status: d.get('status') || '',
+    agentName: d.get('agentName') || d.get('requestedByName') || '', requestedAtMs: d.get('requestedAtMs') || 0,
+    handoverByName: d.get('handoverByName') || '', handoverByEmail: d.get('handoverByEmail') || '',
+    handoverAtMs: d.get('handoverAtMs') || d.get('deliveredAtMs') || 0,
+    settledByEmail: d.get('settledByEmail') || '', settledAtMs: d.get('settledAtMs') || ms(d.get('settledAt')) || 0,
+  })).filter((x) => x.handoverAtMs >= cutoff).sort((a, z) => z.handoverAtMs - a.handoverAtMs);
+  return { items };
+}
+
+async function dutyLogs(dec, b) {
+  const agencyId = await ownerAgency(dec);
+  const cutoff = Date.now() - SIX_MONTHS;
+  const want = String(b.agentUid || '');
+  const s = await db().collection('dutyLogs').where('agencyId', '==', agencyId).get();
+  const logs = s.docs.map((d) => ({
+    id: d.id, agentUid: d.get('agentUid') || '', agentId: d.get('agentId') || '', agentName: d.get('agentName') || 'Agent',
+    on: d.get('on') === true, atMs: d.get('atMs') || ms(d.get('at')), lat: d.get('lat') ?? null, lng: d.get('lng') ?? null,
+  })).filter((x) => x.atMs >= cutoff && (!want || x.agentUid === want)).sort((a, z) => z.atMs - a.atMs).slice(0, 3000);
+  return { logs };
+}
+
+const ACTIONS = { 'delete-account': deleteAccount, 'cancel-booking': cancelBooking, 'set-slot': setSlot, 'service-request': serviceRequest, 'owner-booking': ownerBooking, 'cash-add': cashAdd, 'cash-list': cashList, 'emergency-handover': emergencyHandover, 'pending-otp-list': pendingOtpList, 'pending-otp-settle': pendingOtpSettle, 'pending-otp-resend': pendingOtpResend, 'emergency-history': emergencyHistory, 'duty-logs': dutyLogs };
 
 
 const DEFAULT_FLAGS = { onlinePayment: false, kyc: false };

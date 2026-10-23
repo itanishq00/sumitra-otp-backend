@@ -54,6 +54,19 @@ function previouslyDeducted(b) {
   return 0;
 }
 
+async function agentInfo(db, agent) {
+  const id = String(agent.agentId || '');
+  let d = null;
+  if (id) {
+    try { const s = await db.collection('deliveryAgents').doc(id).get(); if (s.exists) d = s.data(); } catch (_) {}
+  }
+  return {
+    agentId: id,
+    agencyId: (d && d.agencyId) || agent.agencyId || AGENCY_ID,
+    name: String((d && (d.name || d.fullName)) || agent.name || 'Agent'),
+  };
+}
+
 module.exports = async (req, res) => {
   if (cors(req, res)) return;
 
@@ -75,6 +88,36 @@ module.exports = async (req, res) => {
   }
 
   const { action, bookingId, otp, cashAmount } = parseBody(req);
+  // ---------- DUTY ON/OFF (bookingId nahi chahiye) ----------
+  if (action === 'duty' || action === 'duty-status') {
+    try {
+      const db0 = admin.firestore();
+      const FV0 = admin.firestore.FieldValue;
+      const ai = await agentInfo(db0, agent);
+      const locRef = db0.collection('agentLocations').doc(agent.uid);
+      if (action === 'duty-status') {
+        const s = await locRef.get();
+        return send(res, 200, true, 'ok', { onDuty: s.exists && s.get('onDuty') === true });
+      }
+      const body = parseBody(req);
+      const on = body.on === true;
+      const lat = Number(body.lat); const lng = Number(body.lng);
+      const hasLoc = body.lat !== undefined && body.lng !== undefined && Number.isFinite(lat) && Number.isFinite(lng);
+      await db0.collection('dutyLogs').add({
+        agencyId: ai.agencyId, agentUid: agent.uid, agentId: ai.agentId, agentName: ai.name, on,
+        at: FV0.serverTimestamp(), atMs: Date.now(), ...(hasLoc ? { lat, lng } : {}),
+      });
+      await locRef.set({
+        agencyId: ai.agencyId, agentUid: agent.uid, agentId: ai.agentId, agentName: ai.name, onDuty: on,
+        dutyChangedAt: FV0.serverTimestamp(), ...(hasLoc ? { lat, lng, updatedAt: FV0.serverTimestamp() } : {}),
+      }, { merge: true });
+      return send(res, 200, true, on ? 'Duty ON. Aapki location owner ko dikhegi.' : 'Duty OFF. Location share band.', { onDuty: on });
+    } catch (e) {
+      console.error('duty error:', e);
+      return send(res, 500, false, 'Server error');
+    }
+  }
+
   if (!bookingId || typeof bookingId !== 'string') {
     return send(res, 400, false, 'bookingId required.');
   }
@@ -162,7 +205,8 @@ module.exports = async (req, res) => {
         title: '🚨 Emergency handover',
         body: `${agent.name || 'Agent'} ${b.customerName || 'customer'} ke ghar pahunch gaya. Dashboard > Pending OTP se "Bina OTP handover" karo.`,
       }));
-      await bookingRef.update({ handoverRequestedAt: FieldValue.serverTimestamp() });
+      const ai = await agentInfo(db, agent);
+      await bookingRef.update({ handoverRequestedAt: FieldValue.serverTimestamp(), handoverRequestedAtMs: Date.now(), handoverRequestedByName: ai.name, handoverRequestedByUid: agent.uid });
       return send(res, 200, true, 'Owner ko request bhej di. Owner ke handover karte hi order Delivered ho jayega.');
     }
 
