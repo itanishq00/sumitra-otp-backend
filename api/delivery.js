@@ -91,6 +91,7 @@ module.exports = async (req, res) => {
       if (!snap.exists) return send(res, 404, false, 'Order nahi mila.');
       const b = snap.data();
       if (b.agentUid !== agent.uid) return send(res, 403, false, 'Ye order aapka nahi hai.');
+      if (b.isEmergency || b.isSettlement) return send(res, 409, false, 'Emergency order: OTP nahi lagega. Owner apne app se handover karega.');
       if (b.orderStatus === 'DELIVERED') return send(res, 200, true, 'Order pehle hi deliver ho chuka hai.');
       if (b.orderStatus !== 'ARRIVED') return send(res, 400, false, 'Pehle "Mark Arrived" karo.');
 
@@ -168,6 +169,7 @@ module.exports = async (req, res) => {
 
         if (b.orderStatus === 'DELIVERED') return { already: true };
         if (b.agentUid !== agent.uid) throw httpError(403, 'Ye order aapka nahi hai.');
+        if (b.isEmergency || b.isSettlement) throw httpError(409, 'Emergency order: OTP nahi lagega. Owner apne app se handover karega.');
         if (b.orderStatus !== 'ARRIVED') throw httpError(400, 'Order abhi "Arrived" status me nahi hai.');
         if (!oSnap.exists) throw httpError(400, 'Pehle "SEND OTP TO CUSTOMER" dabao.');
 

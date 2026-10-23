@@ -2,6 +2,7 @@
 // Actions: cancel-booking, set-slot, service-request (customer) | owner-booking, cash-add, cash-list (owner)
 const admin = require('./_lib/firebase');
 const { sendToUsers, ownerUids } = require('./_lib/notify');
+const { otpDoc } = require('./_lib/emergency');
 
 const GAP_DAYS = 45;
 const SLOTS = ['Kabhi bhi', 'Subah (8-12)', 'Dopahar (12-4)', 'Shaam (4-8)'];
@@ -87,7 +88,14 @@ async function ownerBooking(dec, b) {
   if (hist.docs.some(isActive)) throw new HttpError(409, 'Is customer ki ek booking pehle se chal rahi hai.');
   const last = ms(c.get('lastBookingAt'));
   const days = last ? Math.floor((Date.now() - last) / 86400e3) : null;
-  if (days !== null && days < GAP_DAYS && b.force !== true) {
+  const emergency = b.emergency === true;
+  const reason = String(b.reason || '').trim().slice(0, 200);
+  if (emergency) {
+    if (reason.length < 5) throw new HttpError(400, 'Emergency ki wajah likho (kam se kam 5 akshar).');
+    if (c.get('emergencyPendingId')) throw new HttpError(409, 'Is customer ka pichhla emergency cylinder ka hisaab (Pending OTP) abhi baaki hai.');
+    if (days === null || days >= GAP_DAYS) throw new HttpError(409, `${GAP_DAYS} din poore hain. Emergency ki zaroorat nahi, normal booking karo.`);
+  }
+  if (days !== null && days < GAP_DAYS && b.force !== true && !emergency) {
     throw new HttpError(412, `Pichhli booking ${days} din pehle hui thi (${GAP_DAYS} din ka niyam).`, { needsForce: true });
   }
   let unitPrice = null;
@@ -103,14 +111,15 @@ async function ownerBooking(dec, b) {
     consumerNumber: c.get('consumerNumber') || null, cylinderType: type, quantity: 1, status: 'Pending',
     ...(unitPrice !== null ? { unitPrice, totalAmount: unitPrice, paymentMethod: 'COD', paymentStatus: 'CASH_PENDING' } : {}),
     source: 'ownerApp', bookedByOwner: dec.uid, gapOverride: days !== null && days < GAP_DAYS,
+    ...(emergency ? { isEmergency: true, emergencyReason: reason, emergencyDueAtMs: last + GAP_DAYS * 86400e3, prevLastBookingId: c.get('lastBookingId') || null } : {}),
     bookingDate: FV().serverTimestamp(), createdAt: FV().serverTimestamp(), updatedAt: FV().serverTimestamp(),
   });
-  batch.update(cref, { lastBookingAt: FV().serverTimestamp(), lastBookingId: ref.id, updatedAt: FV().serverTimestamp() });
+  if (!emergency) batch.update(cref, { lastBookingAt: FV().serverTimestamp(), lastBookingId: ref.id, updatedAt: FV().serverTimestamp() });
   await batch.commit();
-  await audit(agencyId, dec.uid, 'owner', 'OWNER_BOOKING_FOR_CUSTOMER', 'booking', ref.id, { customerId: c.id, force: b.force === true });
+  await audit(agencyId, dec.uid, 'owner', emergency ? 'EMERGENCY_BOOKING' : 'OWNER_BOOKING_FOR_CUSTOMER', 'booking', ref.id, { customerId: c.id, force: b.force === true, emergency, reason: emergency ? reason : null });
   await safe(() => sendToUsers([c.id], { type: 'BOOKING_CREATED', agencyId, bookingId: ref.id, dedupeKey: `OWNER_BOOKING_${ref.id}`,
     title: 'Aapki booking ho gayi', body: `Agency ne aapke liye 1 × ${type} cylinder book kiya hai.` }));
-  return { message: 'Booking ho gayi (Pending).', bookingId: ref.id };
+  return { message: emergency ? 'Emergency booking ho gayi. Approve karke agent assign karo; agent ke pahunchne par "Bina OTP handover" karo.' : 'Booking ho gayi (Pending).', bookingId: ref.id };
 }
 
 async function cashAdd(dec, b) {
@@ -152,7 +161,147 @@ async function deleteAccount(dec) {
   return { message: 'Account delete ho gaya.' };
 }
 
-const ACTIONS = { 'delete-account': deleteAccount, 'cancel-booking': cancelBooking, 'set-slot': setSlot, 'service-request': serviceRequest, 'owner-booking': ownerBooking, 'cash-add': cashAdd, 'cash-list': cashList };
+// ---------- Emergency cylinder (bina OTP, owner handover) + Pending OTP ----------
+const PENDING = 'pendingOtps';
+const MAX_TRIES = 5;
+const sizeKey = (t) => { t = String(t || ''); if (t.includes('14')) return '14'; if (t.includes('19')) return '19'; if (t.includes('5')) return '5'; return null; };
+const prevDeducted = (x) => ((x.inventoryDeductedQty !== undefined && x.inventoryDeductedQty !== null) ? (Number(x.inventoryDeductedQty) || 0)
+  : ((x.status === 'Confirmed' || x.status === 'Partially Confirmed') ? (Number(x.confirmedQuantity) || 0) : 0));
+
+async function emergencyHandover(dec, b) {
+  const agencyId = await ownerAgency(dec);
+  const id = String(b.bookingId || '');
+  if (!id) throw new HttpError(400, 'bookingId chahiye.');
+  const bref = db().doc(`bookings/${id}`);
+  const out = await db().runTransaction(async (tx) => {
+    const s = await tx.get(bref);
+    if (!s.exists || s.get('agencyId') !== agencyId) throw new HttpError(404, 'Booking aapki agency me nahi mili.');
+    const x = s.data();
+    if (x.isEmergency !== true) throw new HttpError(409, 'Ye emergency booking nahi hai. Normal delivery OTP se hogi.');
+    if (x.orderStatus === 'DELIVERED') throw new HttpError(409, 'Ye booking pehle hi deliver ho chuki hai.');
+    if (x.orderStatus !== 'ARRIVED' || !x.agentUid) throw new HttpError(409, 'Agent ne abhi "Arrived" mark nahi kiya. Agent ke pahunchne ke baad handover karo.');
+    const cref = db().doc(`customers/${x.customerId}`);
+    const cylRef = db().doc(`inventory/${agencyId}__cylinder`);
+    const c = await tx.get(cref);
+    const cyl = await tx.get(cylRef);
+    if (c.exists && c.get('emergencyPendingId') && c.get('emergencyPendingId') !== id) throw new HttpError(409, 'Is customer ka ek aur emergency hisaab pending hai.');
+    const qty = Math.max(1, parseInt(x.quantity, 10) || 1);
+    const amount = Number(x.totalAmount) > 0 ? Number(x.totalAmount) : (Number(x.unitPrice) || 0) * qty;
+    const paid = ['CASH_COLLECTED', 'ONLINE_PAID'].includes(x.paymentStatus);
+    const needCash = (x.paymentMethod || 'COD') === 'COD' && !paid;
+    if (needCash) {
+      if (!(amount > 0)) throw new HttpError(400, 'Is booking ka amount set nahi hai. Cylinder Prices check karo.');
+      if (Number(b.cashAmount) !== amount) throw new HttpError(400, `Amount match nahi hua. Is booking ka amount ₹${amount} hai.`, { amount });
+    }
+    const size = sizeKey(x.cylinderType);
+    const upd = {};
+    if (!(prevDeducted(x) > 0) && size) {
+      const inv = cyl.data() || {};
+      const filled = Number(inv[`filled${size}`]) || 0; const empty = Number(inv[`empty${size}`]) || 0;
+      if (filled < qty) throw new HttpError(400, `Inventory me sirf ${filled} filled ${size} kg cylinder hain.`);
+      tx.set(cylRef, { [`filled${size}`]: filled - qty, [`empty${size}`]: empty + qty, updatedAt: FV().serverTimestamp() }, { merge: true });
+      Object.assign(upd, { inventoryDeductedQty: qty, inventoryDeductedType: x.cylinderType || '', confirmedQuantity: qty });
+    }
+    if (needCash) Object.assign(upd, { unitPrice: Number(x.unitPrice) || amount / qty, totalAmount: amount, paymentMethod: 'COD', paymentStatus: 'CASH_COLLECTED',
+      paidAmount: amount, paymentCollectedAt: FV().serverTimestamp(), paymentCollectedBy: x.agentId || '' });
+    const dueAtMs = Number(x.emergencyDueAtMs) || Date.now() + GAP_DAYS * 86400e3;
+    tx.update(bref, { orderStatus: 'DELIVERED', status: 'Delivered', pendingQuantity: 0, deliveredAt: FV().serverTimestamp(), deliveredBy: x.agentId || '',
+      verificationMethod: 'OWNER_EMERGENCY', verificationStatus: 'PENDING_OTP', handoverBy: dec.uid,
+      statusChangedAt: FV().serverTimestamp(), updatedAt: FV().serverTimestamp(), ...upd });
+    tx.delete(db().doc(`deliveryOtps/${id}`));
+    if (needCash) tx.set(db().doc(`payments/pay_${id}`), { paymentId: `pay_${id}`, orderId: id, customerName: String(x.customerName || '').trim(), settled: false,
+      customerId: x.customerId || '', agencyId, agentId: x.agentId || '', agentUid: x.agentUid, amount, paymentMethod: 'COD', paymentStatus: 'CASH_COLLECTED',
+      transactionId: null, collectedAt: FV().serverTimestamp(), createdAt: FV().serverTimestamp(), updatedAt: FV().serverTimestamp() });
+    tx.set(db().doc(`${PENDING}/${id}`), { agencyId, customerId: x.customerId, customerName: x.customerName || 'Customer', customerMobile: x.customerMobile || '',
+      consumerNumber: x.consumerNumber || null, cylinderType: x.cylinderType || '', emergencyBookingId: id, reason: x.emergencyReason || '',
+      amount: needCash ? amount : 0, agentUid: x.agentUid, status: 'WAITING', dueAtMs, deliveredAtMs: Date.now(), handoverBy: dec.uid,
+      createdAt: FV().serverTimestamp(), updatedAt: FV().serverTimestamp() });
+    tx.set(cref, { emergencyPendingId: id, updatedAt: FV().serverTimestamp() }, { merge: true });
+    tx.set(db().collection('inventoryActivity').doc(), { agencyId, action: 'Emergency Cylinder Delivered', section: 'Cylinder', item: `${size || ''} kg Cylinder`,
+      summary: `${qty} filled ${x.cylinderType || ''} cylinder ${x.customerName || 'Customer'} ko emergency me diya (bina OTP, owner handover).`, direction: 'out',
+      customerName: x.customerName || '', consumerNumber: x.consumerNumber || '', customerId: x.customerId || '', bookingId: id,
+      changedByUid: dec.uid, changedByName: 'Owner', changedByEmail: dec.email || '', source: 'emergency', changedAt: FV().serverTimestamp() });
+    return { customerId: x.customerId, dueAtMs, amount: needCash ? amount : 0 };
+  });
+  await audit(agencyId, dec.uid, 'owner', 'EMERGENCY_HANDOVER_NO_OTP', 'booking', id, { dueAtMs: out.dueAtMs, amount: out.amount });
+  await safe(() => sendToUsers([out.customerId], { type: 'DELIVERED', agencyId, bookingId: id, dedupeKey: `EMERGENCY_${id}`,
+    title: 'Emergency cylinder diya gaya', body: `Agency ne aapko emergency cylinder diya hai. ${istDate(out.dueAtMs)} ko agli booking apne aap banegi, uska OTP agency ko batana hoga.` }));
+  return { message: 'Emergency cylinder de diya gaya. Customer "Pending OTP" me hai.', dueDate: istDate(out.dueAtMs) };
+}
+
+async function pendingOtpList(dec) {
+  const agencyId = await ownerAgency(dec);
+  const s = await db().collection(PENDING).where('agencyId', '==', agencyId).get();
+  const items = s.docs.filter((d) => d.get('status') !== 'SETTLED').map((d) => ({
+    id: d.id, customerId: d.get('customerId'), customerName: d.get('customerName') || 'Customer', customerMobile: d.get('customerMobile') || '',
+    consumerNumber: d.get('consumerNumber') || '', cylinderType: d.get('cylinderType') || '', reason: d.get('reason') || '', amount: d.get('amount') || 0,
+    status: d.get('status'), dueAtMs: d.get('dueAtMs') || 0, dueDate: istDate(d.get('dueAtMs') || 0), deliveredAtMs: d.get('deliveredAtMs') || 0,
+    settlementBookingId: d.get('settlementBookingId') || null, locked: d.get('locked') === true, escalated: !!d.get('escalatedAt'),
+  })).sort((a, z) => a.dueAtMs - z.dueAtMs);
+  return { items };
+}
+
+async function pendingOtpSettle(dec, b) {
+  const agencyId = await ownerAgency(dec);
+  const id = String(b.pendingId || ''); const entered = String(b.otp || '');
+  if (!id) throw new HttpError(400, 'pendingId chahiye.');
+  if (!/^\d{4}$/.test(entered)) throw new HttpError(400, '4-digit OTP daalo.');
+  const pref = db().doc(`${PENDING}/${id}`);
+  const r = await db().runTransaction(async (tx) => {
+    const p = await tx.get(pref);
+    if (!p.exists || p.get('agencyId') !== agencyId) throw new HttpError(404, 'Pending entry nahi mili.');
+    if (p.get('status') === 'SETTLED') return { already: true };
+    if (p.get('status') !== 'OTP_PENDING') throw new HttpError(409, `Abhi OTP nahi bana. ${istDate(p.get('dueAtMs') || Date.now())} ko customer ki booking apne aap banegi.`);
+    const sid = p.get('settlementBookingId');
+    const oref = db().doc(`deliveryOtps/${sid}`);
+    const o = await tx.get(oref);
+    if (!o.exists) throw new HttpError(409, 'OTP nahi mila. "Naya OTP" bhejo.');
+    const att = o.get('attempts') || 0;
+    if ((o.get('expiresAtMs') || 0) < Date.now()) throw new HttpError(409, 'OTP expire ho gaya. "Naya OTP" bhejo.', { expired: true });
+    if (att >= MAX_TRIES) throw new HttpError(429, 'Bahut baar galat OTP. "Naya OTP" bhejo (24 ghante me ek baar).', { locked: true });
+    if (o.get('otp') !== entered) {
+      tx.update(oref, { attempts: att + 1 });
+      if (att + 1 >= MAX_TRIES) tx.update(pref, { locked: true, updatedAt: FV().serverTimestamp() });
+      return { wrong: true, left: MAX_TRIES - att - 1 };
+    }
+    tx.update(db().doc(`bookings/${sid}`), { status: 'Delivered', orderStatus: 'DELIVERED', verificationMethod: 'OTP_SETTLEMENT', verificationStatus: 'VERIFIED',
+      verifiedAt: FV().serverTimestamp(), deliveredAt: FV().serverTimestamp(), statusChangedAt: FV().serverTimestamp(), updatedAt: FV().serverTimestamp() });
+    tx.update(db().doc(`bookings/${id}`), { verificationStatus: 'VERIFIED', settledBy: sid, verifiedAt: FV().serverTimestamp(), updatedAt: FV().serverTimestamp() });
+    tx.delete(oref);
+    tx.update(pref, { status: 'SETTLED', locked: false, settledAt: FV().serverTimestamp(), settledBy: dec.uid, updatedAt: FV().serverTimestamp() });
+    tx.set(db().doc(`customers/${p.get('customerId')}`), { emergencyPendingId: FV().delete(), updatedAt: FV().serverTimestamp() }, { merge: true });
+    return { done: true, customerId: p.get('customerId') };
+  });
+  if (r.wrong) throw new HttpError(400, `OTP galat hai. ${r.left} try baaki.`, { left: r.left });
+  if (r.already) return { message: 'Ye hisaab pehle hi poora ho chuka hai.' };
+  await audit(agencyId, dec.uid, 'owner', 'PENDING_OTP_SETTLED', 'booking', id);
+  await safe(() => sendToUsers([r.customerId], { type: 'DELIVERED', agencyId, bookingId: id, dedupeKey: `SETTLED_${id}`,
+    title: 'Emergency cylinder ka hisaab poora ✅', body: `Dhanyavaad! Agli booking ${GAP_DAYS} din baad kar sakte ho.` }));
+  return { message: 'OTP sahi. Emergency cylinder ka hisaab poora ho gaya ✅' };
+}
+
+async function pendingOtpResend(dec, b) {
+  const agencyId = await ownerAgency(dec);
+  const id = String(b.pendingId || '');
+  if (!id) throw new HttpError(400, 'pendingId chahiye.');
+  const pref = db().doc(`${PENDING}/${id}`); const p = await pref.get();
+  if (!p.exists || p.get('agencyId') !== agencyId) throw new HttpError(404, 'Pending entry nahi mili.');
+  if (p.get('status') !== 'OTP_PENDING') throw new HttpError(409, 'Is entry ka OTP abhi bana nahi, ya hisaab poora ho chuka hai.');
+  const sid = p.get('settlementBookingId'); const oref = db().doc(`deliveryOtps/${sid}`); const o = await oref.get();
+  const usable = o.exists && (o.get('attempts') || 0) < MAX_TRIES && (o.get('expiresAtMs') || 0) > Date.now();
+  if (usable) throw new HttpError(409, 'Purana OTP abhi chal raha hai. Customer apne app me dekh sakta hai.');
+  if (o.exists && Date.now() - (o.get('sentAtMs') || 0) < 86400e3) throw new HttpError(429, 'Naya OTP 24 ghante me ek hi baar bhej sakte hain.');
+  const n = p.get('resendCount') || 0;
+  if (n >= 3) throw new HttpError(429, 'Naye OTP ki limit (3) khatam. Support se baat karo.');
+  await oref.set(otpDoc(p.data(), sid));
+  await pref.update({ resendCount: n + 1, locked: false, otpSentAtMs: Date.now(), updatedAt: FV().serverTimestamp() });
+  await audit(agencyId, dec.uid, 'owner', 'PENDING_OTP_RESENT', 'booking', id, { count: n + 1 });
+  await safe(() => sendToUsers([p.get('customerId')], { type: 'BOOKING_REMINDER', agencyId, bookingId: sid, dedupeKey: `PENDING_OTP_NEW_${id}_${n + 1}`,
+    title: 'Naya OTP', body: 'Emergency cylinder ke hisaab ka naya OTP app me hai. Agency ko batayein.' }));
+  return { message: 'Customer ko naya OTP bhej diya.' };
+}
+
+const ACTIONS = { 'delete-account': deleteAccount, 'cancel-booking': cancelBooking, 'set-slot': setSlot, 'service-request': serviceRequest, 'owner-booking': ownerBooking, 'cash-add': cashAdd, 'cash-list': cashList, 'emergency-handover': emergencyHandover, 'pending-otp-list': pendingOtpList, 'pending-otp-settle': pendingOtpSettle, 'pending-otp-resend': pendingOtpResend };
 
 
 const DEFAULT_FLAGS = { onlinePayment: false, kyc: false };
