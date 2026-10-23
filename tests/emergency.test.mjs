@@ -105,3 +105,9 @@ test('E11 settle: galat OTP 400, sahi OTP -> SETTLED', async () => {
   assert.equal((await db.doc(`bookings/${p.settlementBookingId}`).get()).get('orderStatus'), 'DELIVERED');
   assert.equal((await db.doc('customers/ec1').get()).get('emergencyPendingId'), undefined);
 });
+test('E12 agent emergency handover request', async () => {
+  await db.doc('bookings/ebreq').set({ customerId: 'ec2', agencyId: 'agE', status: 'Approved', orderStatus: 'ARRIVED', agentUid: 'eag1', isEmergency: true, customerName: 'ec2' });
+  await db.doc('bookings/enorm').set({ customerId: 'ec2', agencyId: 'agE', status: 'Approved', orderStatus: 'ARRIVED', agentUid: 'eag1' });
+  assert.equal((await dcall('eag1', { action: 'emergency-request', bookingId: 'ebreq' })).code, 200);
+  assert.equal((await dcall('eag1', { action: 'emergency-request', bookingId: 'enorm' })).code, 409);
+});

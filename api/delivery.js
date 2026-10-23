@@ -144,6 +144,28 @@ module.exports = async (req, res) => {
       return send(res, 200, true, 'OTP bhej diya. Customer apne app me OTP dekhega.');
     }
 
+    // ---------- EMERGENCY: owner ko handover request ----------
+    if (action === 'emergency-request') {
+      const snap = await bookingRef.get();
+      if (!snap.exists) return send(res, 404, false, 'Order nahi mila.');
+      const b = snap.data();
+      if (b.agentUid !== agent.uid) return send(res, 403, false, 'Ye order aapka nahi hai.');
+      if (b.isEmergency !== true) return send(res, 409, false, 'Ye emergency order nahi hai.');
+      if (b.orderStatus === 'DELIVERED') return send(res, 200, true, 'Order pehle hi deliver ho chuka hai.');
+      if (b.orderStatus !== 'ARRIVED') return send(res, 400, false, 'Pehle "Mark Arrived" karo.');
+      const slot = Math.floor(Date.now() / (5 * 60 * 1000));
+      await safe(async () => sendToUsers(await ownerUids(b.agencyId), {
+        type: 'OTP_LOCKED',
+        agencyId: b.agencyId || null,
+        bookingId,
+        dedupeKey: `EMERGENCY_REQ_${bookingId}_${slot}`,
+        title: '🚨 Emergency handover',
+        body: `${agent.name || 'Agent'} ${b.customerName || 'customer'} ke ghar pahunch gaya. Dashboard > Pending OTP se "Bina OTP handover" karo.`,
+      }));
+      await bookingRef.update({ handoverRequestedAt: FieldValue.serverTimestamp() });
+      return send(res, 200, true, 'Owner ko request bhej di. Owner ke handover karte hi order Delivered ho jayega.');
+    }
+
     // ---------- COMPLETE DELIVERY ----------
     if (action === 'complete') {
       const entered = String(otp || '');
