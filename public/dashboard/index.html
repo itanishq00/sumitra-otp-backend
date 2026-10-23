@@ -1,0 +1,142 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Distributor Dashboard</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:#f3f6fb;color:#1b2a41}
+.center{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
+.card{background:#fff;border:1px solid #e1e8f3;border-radius:16px;padding:22px}
+.login{width:360px}.login h1{font-size:22px;margin-bottom:4px}.muted{color:#6b7a90;font-size:13px}
+input,select{width:100%;padding:11px 12px;border:1px solid #cfd9e8;border-radius:10px;font-size:15px;margin-top:10px}
+button{background:#1565C0;color:#fff;border:0;border-radius:10px;padding:11px 16px;font-size:15px;font-weight:600;cursor:pointer}
+button.ghost{background:#fff;color:#1565C0;border:1px solid #1565C0}.err{color:#c62828;font-size:13px;margin-top:10px;min-height:18px}
+header{background:linear-gradient(135deg,#0b3a7a,#1565C0);color:#fff;padding:18px 28px;display:flex;align-items:center;gap:14px}
+header h1{font-size:20px;flex:1}header .muted{color:#cfe0ff}
+main{padding:22px 28px;max-width:1400px;margin:0 auto}
+.kpis{display:grid;grid-template-columns:repeat(6,1fr);gap:14px;margin-bottom:20px}
+.kpi{background:#fff;border:1px solid #e1e8f3;border-radius:14px;padding:16px}.kpi b{display:block;font-size:26px}.kpi span{font-size:13px;color:#6b7a90}
+.tabs{display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap}.tab{background:#fff;color:#1b2a41;border:1px solid #d6e0ee}.tab.on{background:#1565C0;color:#fff;border-color:#1565C0}
+table{width:100%;border-collapse:collapse;background:#fff;border-radius:12px;overflow:hidden;font-size:14px}
+th{background:#eef4fb;text-align:left;padding:10px;font-size:13px;color:#33465f}td{padding:10px;border-top:1px solid #eef2f7}
+.chip{display:inline-block;padding:3px 10px;border-radius:12px;font-size:12px;font-weight:600}
+.ok{background:#e8f5e9;color:#2E7D32}.wa{background:#fff3e0;color:#E65100}.da{background:#ffebee;color:#c62828}.in{background:#e3f2fd;color:#1565C0}
+.row{display:flex;gap:10px;align-items:center;margin-bottom:12px;flex-wrap:wrap}.row input,.row select{width:auto;margin:0}
+.bars{display:flex;align-items:flex-end;gap:6px;height:180px;padding:12px;background:#fff;border:1px solid #e1e8f3;border-radius:14px}
+.bar{flex:1;background:#1565C0;border-radius:6px 6px 0 0;position:relative;min-height:2px}.bar i{position:absolute;bottom:-20px;left:0;right:0;text-align:center;font-size:10px;color:#6b7a90;font-style:normal}
+.grid2{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin:30px 0 16px}
+.note{font-size:12px;color:#6b7a90;margin-top:14px}
+@media(max-width:900px){.kpis{grid-template-columns:repeat(2,1fr)}.grid2{grid-template-columns:1fr}}
+</style></head><body>
+<div id="login" class="center"><div class="card login"><h1>Distributor Dashboard</h1><p class="muted">Sign in with your owner email and password.</p>
+<input id="email" type="email" placeholder="Email"><input id="pass" type="password" placeholder="Password">
+<div class="err" id="err"></div><button id="loginBtn" style="width:100%;margin-top:6px">Sign in</button></div></div>
+<div id="app" hidden><header><div style="flex:1"><h1 id="agency">Dashboard</h1><div class="muted" id="sub">Read-only view</div></div>
+<button class="ghost" id="refresh" style="background:#fff">Refresh</button><button class="ghost" id="logout" style="background:#fff">Sign out</button></header>
+<main><div class="kpis" id="kpis"></div><div class="tabs" id="tabs"></div><div id="view"></div>
+<p class="note">Read-only. Approvals and edits are done in the mobile app so stock stays correct.</p></main></div>
+<script type="module">
+import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js';
+import { getAuth, signInWithEmailAndPassword, onAuthStateChanged, signOut } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js';
+import { getFirestore, collection, query, where, orderBy, limit, getDocs, doc, getDoc } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js';
+const app = initializeApp({"apiKey": "AIzaSyDUQnjOj4gjMD3THtCXRN0dARODilfUiW0", "projectId": "gas-agency-app", "authDomain": "gas-agency-app.firebaseapp.com", "appId": "1:505152428698:web:a4ee105ac7445695b95d23"}); const auth = getAuth(app); const db = getFirestore(app);
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const ts = v => v && v.toDate ? v.toDate() : null;
+const fmt = d => d ? d.toLocaleString('en-IN', {day:'2-digit', month:'short', hour:'2-digit', minute:'2-digit'}) : '-';
+const num = v => typeof v === 'number' ? v : (parseInt(v) || 0);
+const isDel = b => String(b.orderStatus || '').toUpperCase() === 'DELIVERED' || b.status === 'Delivered';
+const isWay = b => !isDel(b) && /OUT|ARRIV|OTP/.test(String(b.orderStatus || '').toUpperCase());
+const isOpenIssue = i => !/RESOLV|CLOS/i.test(String(i.status || ''));
+const same = (a, b) => a && a.toDateString() === b.toDateString();
+let S = null, TAB = 'bookings';
+$('#loginBtn').onclick = async () => { $('#err').textContent = ''; try { await signInWithEmailAndPassword(auth, $('#email').value.trim(), $('#pass').value); } catch (e) { $('#err').textContent = 'Sign-in failed: ' + (e.code || e.message); } };
+$('#pass').addEventListener('keydown', e => { if (e.key === 'Enter') $('#loginBtn').click(); });
+$('#logout').onclick = () => signOut(auth);
+$('#refresh').onclick = () => auth.currentUser && load(auth.currentUser);
+onAuthStateChanged(auth, async u => {
+  $('#login').hidden = !!u; $('#app').hidden = !u;
+  if (u) { try { await load(u); } catch (e) { await signOut(auth); $('#err').textContent = e.message || String(e); } }
+});
+async function safe(p) { try { return (await p).docs.map(d => ({ id: d.id, ...d.data() })); } catch (_) { return []; } }
+async function load(u) {
+  $('#sub').textContent = 'Loading...';
+  const tok = await u.getIdTokenResult(true); let agencyId = tok.claims.agencyId || '';
+  try { const a = await getDoc(doc(db, 'admins', u.uid)); if (a.exists() && a.data().agencyId) agencyId = a.data().agencyId; } catch (_) {}
+  if (!agencyId) throw new Error('This account is not linked to a distributor.');
+  let name = agencyId; try { const g = await getDoc(doc(db, 'agencies', agencyId)); if (g.exists()) name = g.data().name || name; } catch (_) {}
+  const q = (c, ...x) => getDocs(query(collection(db, c), where('agencyId', '==', agencyId), ...x));
+  const [bookings, customers, issues, agents] = await Promise.all([safe(q('bookings', orderBy('createdAt', 'desc'), limit(300))), safe(q('customers', limit(1000))), safe(q('issues', limit(500))), safe(q('deliveryAgents'))]);
+  S = { name, bookings, customers, issues, agents };
+  $('#agency').textContent = name; $('#sub').textContent = 'Updated ' + new Date().toLocaleTimeString('en-IN') + ' · read-only';
+  render();
+}
+function render() {
+  const now = new Date(), B = S.bookings;
+  const today = B.filter(b => same(ts(b.createdAt), now));
+  const delToday = B.filter(b => isDel(b) && same(ts(b.deliveredAt), now));
+  const cash = delToday.filter(b => !/ONLINE/i.test(String(b.paymentStatus || ''))).reduce((s, b) => s + num(b.paidAmount ?? b.totalAmount), 0);
+  const k = [["Today's bookings", today.length], ['Pending approval', B.filter(b => b.status === 'Pending').length], ['On the way', B.filter(isWay).length],
+             ['Delivered today', delToday.length], ['Open complaints', S.issues.filter(isOpenIssue).length], ['Cash collected today', '₹' + cash.toLocaleString('en-IN')]];
+  $('#kpis').innerHTML = k.map(([l, v]) => `<div class="kpi"><b>${esc(v)}</b><span>${esc(l)}</span></div>`).join('');
+  const tabs = [['bookings', 'Bookings'], ['customers', 'Customers'], ['complaints', 'Complaints'], ['agents', 'Agents'], ['usage', 'Usage']];
+  $('#tabs').innerHTML = tabs.map(([id, l]) => `<button class="tab ${TAB === id ? 'on' : ''}" data-t="${id}">${l}</button>`).join('');
+  document.querySelectorAll('.tab').forEach(b => b.onclick = () => { TAB = b.dataset.t; render(); });
+  ({ bookings: vBookings, customers: vCustomers, complaints: vComplaints, agents: vAgents, usage: vUsage })[TAB]();
+}
+function chip(b) {
+  if (b.cancelledByCustomer) return '<span class="chip da">Cancelled</span>';
+  if (isDel(b)) return '<span class="chip ok">Delivered</span>'; if (isWay(b)) return '<span class="chip in">On the way</span>';
+  if (b.status === 'Pending') return '<span class="chip wa">Pending</span>'; if (b.status === 'Rejected') return '<span class="chip da">Rejected</span>';
+  return `<span class="chip in">${esc(b.status || '-')}</span>`;
+}
+function vBookings() {
+  $('#view').innerHTML = `<div class="row"><input id="q" placeholder="Search name, mobile, consumer no." style="min-width:280px"><select id="f"><option value="">All</option><option>Pending</option><option>On the way</option><option>Delivered</option><option>Rejected</option></select><button id="csv">Download CSV</button></div><div id="tbl"></div>`;
+  const draw = () => {
+    const t = ($('#q').value || '').toLowerCase(), f = $('#f').value;
+    const rows = S.bookings.filter(b => (!t || [b.customerName, b.customerMobile, b.consumerNumber].join(' ').toLowerCase().includes(t)) &&
+      (!f || (f === 'Delivered' ? isDel(b) : f === 'On the way' ? isWay(b) : b.status === f && !isDel(b))));
+    $('#tbl').innerHTML = `<table><tr><th>Booked</th><th>Customer</th><th>Mobile</th><th>Item</th><th>Amount</th><th>Slot</th><th>Status</th><th>Delivered</th></tr>${rows.map(b =>
+      `<tr><td>${fmt(ts(b.createdAt))}</td><td>${esc(b.customerName)}</td><td>${esc(b.customerMobile)}</td><td>${esc((b.quantity || 1) + ' × ' + (b.cylinderType || ''))}</td><td>${b.totalAmount != null ? '₹' + esc(b.totalAmount) : '-'}</td><td>${esc(b.preferredSlot || '-')}</td><td>${chip(b)}</td><td>${fmt(ts(b.deliveredAt))}</td></tr>`).join('')}</table>`;
+    $('#csv').onclick = () => {
+      const head = ['Booked', 'Customer', 'Mobile', 'Consumer No', 'Type', 'Qty', 'Amount', 'Slot', 'Status', 'Delivered'];
+      const lines = [head].concat(rows.map(b => [fmt(ts(b.createdAt)), b.customerName, b.customerMobile, b.consumerNumber, b.cylinderType, b.quantity || 1, b.totalAmount ?? '', b.preferredSlot || '', isDel(b) ? 'Delivered' : b.status, fmt(ts(b.deliveredAt))]));
+      const csv = lines.map(r => r.map(c => '"' + String(c ?? '').replace(/"/g, '""') + '"').join(',')).join('\n');
+      const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob(['\ufeff' + csv], { type: 'text/csv' })); a.download = 'bookings.csv'; a.click();
+    };
+  };
+  $('#q').oninput = draw; $('#f').onchange = draw; draw();
+}
+function vCustomers() {
+  const C = S.customers, pend = C.filter(c => c.verificationStatus === 'pending');
+  $('#view').innerHTML = `<div class="kpis" style="grid-template-columns:repeat(3,1fr)"><div class="kpi"><b>${C.length}</b><span>Customers</span></div><div class="kpi"><b>${C.filter(c => (c.verificationStatus || 'verified') === 'verified').length}</b><span>Verified</span></div><div class="kpi"><b>${pend.length}</b><span>Pending approval</span></div></div>
+  <table><tr><th>Name</th><th>Mobile</th><th>Status</th><th>Signed up</th></tr>${pend.concat(C.filter(c => c.verificationStatus !== 'pending')).slice(0, 300).map(c =>
+  `<tr><td>${esc(c.name)}</td><td>${esc(c.mobile)}</td><td>${c.verificationStatus === 'pending' ? '<span class="chip wa">Pending</span>' : '<span class="chip ok">' + esc(c.verificationStatus || 'verified') + '</span>'}</td><td>${fmt(ts(c.createdAt))}</td></tr>`).join('')}</table>`;
+}
+function vComplaints() {
+  const now = Date.now(), I = S.issues.slice().sort((a, b) => (ts(b.createdAt) || 0) - (ts(a.createdAt) || 0));
+  $('#view').innerHTML = `<table><tr><th>Raised</th><th>Customer</th><th>Issue</th><th>Status</th><th>Age</th></tr>${I.slice(0, 300).map(i => {
+    const d = ts(i.createdAt), h = d ? Math.floor((now - d) / 36e5) : 0, open = isOpenIssue(i);
+    return `<tr><td>${fmt(d)}</td><td>${esc(i.customerName)}</td><td>${esc(i.title || i.category)}</td><td>${open ? '<span class="chip wa">' + esc(i.status || 'Open') + '</span>' : '<span class="chip ok">' + esc(i.status) + '</span>'}</td><td>${open ? (h >= 48 ? '<span class="chip da">' + h + 'h</span>' : h + 'h') : '-'}</td></tr>`; }).join('')}</table>`;
+}
+function vAgents() {
+  const now = new Date(), d30 = Date.now() - 30 * 864e5;
+  $('#view').innerHTML = `<table><tr><th>Agent</th><th>Mobile</th><th>Delivered today</th><th>Cash today</th><th>Delivered (30 days)</th></tr>${S.agents.map(a => {
+    const mine = S.bookings.filter(b => isDel(b) && ((a.authUid && b.agentUid === a.authUid) || b.agentId === a.id));
+    const t = mine.filter(b => same(ts(b.deliveredAt), now));
+    const cash = t.filter(b => !/ONLINE/i.test(String(b.paymentStatus || ''))).reduce((s, b) => s + num(b.paidAmount ?? b.totalAmount), 0);
+    return `<tr><td>${esc(a.name)}</td><td>${esc(a.mobile)}</td><td>${t.length}</td><td>₹${cash.toLocaleString('en-IN')}</td><td>${mine.filter(b => (ts(b.deliveredAt) || 0) >= d30).length}</td></tr>`; }).join('')}</table>`;
+}
+function vUsage() {
+  const now = Date.now(), d30 = now - 30 * 864e5, d90 = now - 90 * 864e5, B = S.bookings;
+  const b30 = B.filter(b => (ts(b.createdAt) || 0) >= d30), del30 = b30.filter(isDel);
+  const hrs = del30.map(b => (ts(b.deliveredAt) - ts(b.createdAt)) / 36e5).filter(h => h > 0).sort((a, b) => a - b);
+  const med = hrs.length ? hrs[Math.floor(hrs.length / 2)] : null;
+  const i30 = S.issues.filter(i => (ts(i.createdAt) || 0) >= d30), res30 = i30.filter(i => !isOpenIssue(i));
+  const active = new Set(B.filter(b => (ts(b.createdAt) || 0) >= d90).map(b => b.customerId)).size;
+  const days = [...Array(14)].map((_, k) => { const d = new Date(now - (13 - k) * 864e5); return { d, n: B.filter(b => isDel(b) && same(ts(b.deliveredAt), d)).length }; });
+  const mx = Math.max(1, ...days.map(x => x.n));
+  $('#view').innerHTML = `<h3 style="margin-bottom:10px">Deliveries, last 14 days</h3><div class="bars">${days.map(x => `<div class="bar" style="height:${Math.round(x.n / mx * 100)}%" title="${x.n}"><i>${x.d.getDate()}</i></div>`).join('')}</div>
+  <div class="grid2"><div class="kpi"><b>${b30.length}</b><span>Bookings (30 days)</span></div><div class="kpi"><b>${del30.length}</b><span>Delivered with OTP (30 days)</span></div>
+  <div class="kpi"><b>${med == null ? '-' : med < 24 ? med.toFixed(1) + ' h' : (med / 24).toFixed(1) + ' days'}</b><span>Median booking to delivery</span></div>
+  <div class="kpi"><b>${i30.length ? Math.round(res30.length / i30.length * 100) + '%' : '-'}</b><span>Complaints resolved (30 days)</span></div>
+  <div class="kpi"><b>${active}</b><span>Active customers (90 days)</span></div><div class="kpi"><b>${S.customers.length}</b><span>Total customers</span></div></div>
+  <p class="note">Based on the latest 300 bookings shown in this dashboard.</p>`;
+}
+</script></body></html>
