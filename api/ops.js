@@ -237,7 +237,7 @@ async function emergencyHandover(dec, b) {
 async function pendingOtpList(dec) {
   const agencyId = await ownerAgency(dec);
   const s = await db().collection(PENDING).where('agencyId', '==', agencyId).get();
-  const items = s.docs.filter((d) => d.get('status') !== 'SETTLED').map((d) => ({
+  const items = s.docs.filter((d) => !['SETTLED', 'REMOVED'].includes(d.get('status'))).map((d) => ({
     id: d.id, customerId: d.get('customerId'), customerName: d.get('customerName') || 'Customer', customerMobile: d.get('customerMobile') || '',
     consumerNumber: d.get('consumerNumber') || '', cylinderType: d.get('cylinderType') || '', reason: d.get('reason') || '', amount: d.get('amount') || 0,
     status: d.get('status'), dueAtMs: d.get('dueAtMs') || 0, dueDate: istDate(d.get('dueAtMs') || 0), deliveredAtMs: d.get('deliveredAtMs') || 0,
@@ -260,6 +260,7 @@ async function pendingOtpSettle(dec, b) {
     const sid = p.get('settlementBookingId');
     const oref = db().doc(`deliveryOtps/${sid}`);
     const o = await tx.get(oref);
+    const eb = await tx.get(db().doc(`bookings/${id}`));
     if (!o.exists) throw new HttpError(409, 'OTP nahi mila. "Naya OTP" bhejo.');
     const att = o.get('attempts') || 0;
     if ((o.get('expiresAtMs') || 0) < Date.now()) throw new HttpError(409, 'OTP expire ho gaya. "Naya OTP" bhejo.', { expired: true });
@@ -271,7 +272,7 @@ async function pendingOtpSettle(dec, b) {
     }
     tx.update(db().doc(`bookings/${sid}`), { status: 'Delivered', orderStatus: 'DELIVERED', verificationMethod: 'OTP_SETTLEMENT', verificationStatus: 'VERIFIED',
       verifiedAt: FV().serverTimestamp(), deliveredAt: FV().serverTimestamp(), statusChangedAt: FV().serverTimestamp(), updatedAt: FV().serverTimestamp() });
-    tx.update(db().doc(`bookings/${id}`), { verificationStatus: 'VERIFIED', settledBy: sid, verifiedAt: FV().serverTimestamp(), updatedAt: FV().serverTimestamp() });
+    if (eb.exists) tx.update(db().doc(`bookings/${id}`), { verificationStatus: 'VERIFIED', settledBy: sid, verifiedAt: FV().serverTimestamp(), updatedAt: FV().serverTimestamp() });
     tx.delete(oref);
     tx.update(pref, { status: 'SETTLED', locked: false, settledAt: FV().serverTimestamp(), settledAtMs: Date.now(), settledBy: dec.uid, settledByEmail: String(dec.email || dec.phone_number || ''), updatedAt: FV().serverTimestamp() });
     tx.set(db().doc(`customers/${p.get('customerId')}`), { emergencyPendingId: FV().delete(), updatedAt: FV().serverTimestamp() }, { merge: true });
@@ -320,6 +321,8 @@ async function emergencyHistory(dec) {
     handoverByName: d.get('handoverByName') || '', handoverByEmail: d.get('handoverByEmail') || '',
     handoverAtMs: d.get('handoverAtMs') || d.get('deliveredAtMs') || 0,
     settledByEmail: d.get('settledByEmail') || '', settledAtMs: d.get('settledAtMs') || ms(d.get('settledAt')) || 0,
+    manual: d.get('manual') === true, removedReason: d.get('removedReason') || '', removedByName: d.get('removedByName') || '',
+    removedByEmail: d.get('removedByEmail') || '', removedAtMs: d.get('removedAtMs') || 0,
   })).filter((x) => x.handoverAtMs >= cutoff).sort((a, z) => z.handoverAtMs - a.handoverAtMs);
   return { items };
 }
@@ -336,7 +339,77 @@ async function dutyLogs(dec, b) {
   return { logs };
 }
 
-const ACTIONS = { 'delete-account': deleteAccount, 'cancel-booking': cancelBooking, 'set-slot': setSlot, 'service-request': serviceRequest, 'owner-booking': ownerBooking, 'cash-add': cashAdd, 'cash-list': cashList, 'emergency-handover': emergencyHandover, 'pending-otp-list': pendingOtpList, 'pending-otp-settle': pendingOtpSettle, 'pending-otp-resend': pendingOtpResend, 'emergency-history': emergencyHistory, 'duty-logs': dutyLogs };
+// ---------- Pending OTP: manually jodo / hatao (owner, audit ke saath) ----------
+async function ownerWho(dec) {
+  const adm = await db().doc(`admins/${dec.uid}`).get();
+  return {
+    name: String((adm.exists && (adm.get('name') || adm.get('ownerName'))) || dec.name || '').trim(),
+    email: String(dec.email || dec.phone_number || '').trim(),
+  };
+}
+
+async function pendingOtpAdd(dec, b) {
+  const agencyId = await ownerAgency(dec);
+  const q = String(b.customerQuery || '').trim();
+  const reason = String(b.reason || '').trim().slice(0, 200);
+  if (!q) throw new HttpError(400, 'Consumer number ya mobile daalo.');
+  if (reason.length < 5) throw new HttpError(400, 'Wajah likho (kam se kam 5 akshar).');
+  let s = await db().collection('customers').where('agencyId', '==', agencyId).where('consumerNumber', '==', q).limit(1).get();
+  if (s.empty) s = await db().collection('customers').where('agencyId', '==', agencyId).where('mobile', '==', q).limit(1).get();
+  if (s.empty) throw new HttpError(404, 'Is consumer number / mobile ka customer aapki agency me nahi mila.');
+  const c = s.docs[0];
+  if (c.get('deleted') === true || c.get('active') === false) throw new HttpError(409, 'Customer active nahi hai.');
+  if (c.get('emergencyPendingId')) throw new HttpError(409, 'Is customer ki ek Pending OTP entry pehle se hai.');
+  let dueAtMs = 0;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(String(b.dueDate || ''))) dueAtMs = Date.parse(`${b.dueDate}T09:00:00+05:30`) || 0;
+  if (!dueAtMs) { const last = ms(c.get('lastBookingAt')); dueAtMs = (last || Date.now()) + GAP_DAYS * 86400e3; }
+  const who = await ownerWho(dec);
+  const ref = db().collection(PENDING).doc();
+  const batch = db().batch();
+  batch.set(ref, {
+    agencyId, customerId: c.id, customerName: c.get('name') || 'Customer', customerMobile: c.get('mobile') || '',
+    consumerNumber: c.get('consumerNumber') || null, cylinderType: c.get('assignedCylinderType') || '', emergencyBookingId: null,
+    reason, amount: 0, status: 'WAITING', dueAtMs, manual: true,
+    handoverBy: dec.uid, handoverByName: who.name, handoverByEmail: who.email, handoverAtMs: Date.now(), deliveredAtMs: Date.now(),
+    createdAt: FV().serverTimestamp(), updatedAt: FV().serverTimestamp(),
+  });
+  batch.set(c.ref, { emergencyPendingId: ref.id, updatedAt: FV().serverTimestamp() }, { merge: true });
+  await batch.commit();
+  await audit(agencyId, dec.uid, 'owner', 'PENDING_OTP_MANUAL_ADD', 'customer', c.id, { pendingId: ref.id, reason, dueAtMs });
+  return { message: `Entry jod di. Auto booking: ${istDate(dueAtMs)}.`, pendingId: ref.id, dueDate: istDate(dueAtMs) };
+}
+
+async function pendingOtpRemove(dec, b) {
+  const agencyId = await ownerAgency(dec);
+  const id = String(b.pendingId || '');
+  const reason = String(b.reason || '').trim().slice(0, 200);
+  if (!id) throw new HttpError(400, 'pendingId chahiye.');
+  if (reason.length < 5) throw new HttpError(400, 'Hatane ki wajah likho (kam se kam 5 akshar).');
+  const who = await ownerWho(dec);
+  const pref = db().doc(`${PENDING}/${id}`);
+  await db().runTransaction(async (tx) => {
+    const p = await tx.get(pref);
+    if (!p.exists || p.get('agencyId') !== agencyId) throw new HttpError(404, 'Pending entry nahi mili.');
+    if (['SETTLED', 'REMOVED'].includes(p.get('status'))) throw new HttpError(409, 'Ye entry pehle hi band ho chuki hai.');
+    const cref = db().doc(`customers/${p.get('customerId')}`);
+    const c = await tx.get(cref);
+    const sid = p.get('settlementBookingId');
+    const sref = sid ? db().doc(`bookings/${sid}`) : null;
+    const sb = sref ? await tx.get(sref) : null;
+    tx.update(pref, { status: 'REMOVED', locked: false, removedReason: reason, removedBy: dec.uid, removedByName: who.name,
+      removedByEmail: who.email, removedAtMs: Date.now(), updatedAt: FV().serverTimestamp() });
+    if (c.exists && c.get('emergencyPendingId') === id) tx.set(cref, { emergencyPendingId: FV().delete(), updatedAt: FV().serverTimestamp() }, { merge: true });
+    if (sb && sb.exists && sb.get('orderStatus') !== 'DELIVERED') {
+      tx.update(sref, { status: 'Rejected', orderStatus: 'CANCELLED', cancelReason: `Pending OTP manually hataya: ${reason}`,
+        cancelledAt: FV().serverTimestamp(), updatedAt: FV().serverTimestamp() });
+      tx.delete(db().doc(`deliveryOtps/${sid}`));
+    }
+  });
+  await audit(agencyId, dec.uid, 'owner', 'PENDING_OTP_MANUAL_REMOVE', 'booking', id, { reason });
+  return { message: 'Entry hata di. Pending OTP count 1 kam ho gaya.' };
+}
+
+const ACTIONS = { 'delete-account': deleteAccount, 'cancel-booking': cancelBooking, 'set-slot': setSlot, 'service-request': serviceRequest, 'owner-booking': ownerBooking, 'cash-add': cashAdd, 'cash-list': cashList, 'emergency-handover': emergencyHandover, 'pending-otp-list': pendingOtpList, 'pending-otp-settle': pendingOtpSettle, 'pending-otp-resend': pendingOtpResend, 'emergency-history': emergencyHistory, 'duty-logs': dutyLogs, 'pending-otp-add': pendingOtpAdd, 'pending-otp-remove': pendingOtpRemove };
 
 
 const DEFAULT_FLAGS = { onlinePayment: false, kyc: false };

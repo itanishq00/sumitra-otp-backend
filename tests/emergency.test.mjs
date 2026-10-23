@@ -111,3 +111,27 @@ test('E12 agent emergency handover request', async () => {
   assert.equal((await dcall('eag1', { action: 'emergency-request', bookingId: 'ebreq' })).code, 200);
   assert.equal((await dcall('eag1', { action: 'emergency-request', bookingId: 'enorm' })).code, 409);
 });
+let MP;
+test('E13 manual Pending OTP jodo (consumer no se)', async () => {
+  await db.doc('customers/ec2').set({ consumerNumber: 'C-002' }, { merge: true });
+  assert.equal((await call('eown', { action: 'pending-otp-add', customerQuery: 'C-002', reason: 'x' })).code, 400);
+  const r = await call('eown', { action: 'pending-otp-add', customerQuery: 'C-002', reason: 'bahar se cylinder diya' });
+  assert.equal(r.code, 200, r.body.message); MP = r.body.pendingId;
+  assert.equal((await db.doc('customers/ec2').get()).get('emergencyPendingId'), MP);
+  assert.equal((await call('eown', { action: 'pending-otp-add', customerQuery: 'C-002', reason: 'dobara jodna' })).code, 409);
+});
+test('E14 manual entry: cron + OTP settle (emergency booking nahi)', async () => {
+  await runSettlements();
+  const p = (await db.doc(`pendingOtps/${MP}`).get()).data(); assert.equal(p.status, 'OTP_PENDING');
+  const otp = (await db.doc(`deliveryOtps/${p.settlementBookingId}`).get()).get('otp');
+  const r = await call('eown', { action: 'pending-otp-settle', pendingId: MP, otp }); assert.equal(r.code, 200, r.body.message);
+});
+test('E15 manually hatao: wajah zaroori, count kam', async () => {
+  const a = await call('eown', { action: 'pending-otp-add', customerQuery: 'C-002', reason: 'phir se bahar diya' }); assert.equal(a.code, 200, a.body.message);
+  const id = a.body.pendingId;
+  assert.equal((await call('eown', { action: 'pending-otp-remove', pendingId: id, reason: 'x' })).code, 400);
+  const r = await call('eown', { action: 'pending-otp-remove', pendingId: id, reason: 'customer ne cash diya' }); assert.equal(r.code, 200, r.body.message);
+  assert.equal((await db.doc(`pendingOtps/${id}`).get()).get('status'), 'REMOVED');
+  assert.equal((await db.doc('customers/ec2').get()).get('emergencyPendingId'), undefined);
+  const l = await call('eown', { action: 'pending-otp-list' }); assert.ok(!l.body.items.some((x) => x.id === id));
+});
