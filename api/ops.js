@@ -117,6 +117,7 @@ async function ownerBooking(dec, b) {
   if (!emergency) batch.update(cref, { lastBookingAt: FV().serverTimestamp(), lastBookingId: ref.id, updatedAt: FV().serverTimestamp() });
   await batch.commit();
   await audit(agencyId, dec.uid, 'owner', emergency ? 'EMERGENCY_BOOKING' : 'OWNER_BOOKING_FOR_CUSTOMER', 'booking', ref.id, { customerId: c.id, force: b.force === true, emergency, reason: emergency ? reason : null });
+  if (!emergency) await safe(() => ROUTE.assignRoute(ref.id));
   await safe(() => sendToUsers([c.id], { type: 'BOOKING_CREATED', agencyId, bookingId: ref.id, dedupeKey: `OWNER_BOOKING_${ref.id}`,
     title: 'Aapki booking ho gayi', body: `Agency ne aapke liye 1 × ${type} cylinder book kiya hai.` }));
   return { message: emergency ? 'Emergency booking ho gayi. Approve karke agent assign karo; agent ke pahunchne par "Bina OTP handover" karo.' : 'Booking ho gayi (Pending).', bookingId: ref.id };
@@ -410,6 +411,8 @@ async function pendingOtpRemove(dec, b) {
 }
 
 const ACTIONS = { 'delete-account': deleteAccount, 'cancel-booking': cancelBooking, 'set-slot': setSlot, 'service-request': serviceRequest, 'owner-booking': ownerBooking, 'cash-add': cashAdd, 'cash-list': cashList, 'emergency-handover': emergencyHandover, 'pending-otp-list': pendingOtpList, 'pending-otp-settle': pendingOtpSettle, 'pending-otp-resend': pendingOtpResend, 'emergency-history': emergencyHistory, 'duty-logs': dutyLogs, 'pending-otp-add': pendingOtpAdd, 'pending-otp-remove': pendingOtpRemove };
+const ROUTE = require('./_lib/routeOps')({ db, FV, HttpError, ownerAgency, sendToUsers, ownerUids, audit, safe });
+Object.assign(ACTIONS, ROUTE.actions);
 
 
 const DEFAULT_FLAGS = { onlinePayment: false, kyc: false };
