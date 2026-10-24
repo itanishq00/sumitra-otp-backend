@@ -87,15 +87,33 @@ module.exports = function makeRoute({ db, FV, HttpError, ownerAgency, sendToUser
     const b = s.data();
     if (CLOSED_S.includes(String(b.status || '')) || CLOSED_O.includes(String(b.orderStatus || ''))) throw new HttpError(409, 'Ye booking band ho chuki hai.');
     if (b.routeStatus === 'PLANNED' && !force) return { route: routeOf(b) };
+    if (['ACCEPTED', 'OUT_FOR_DELIVERY', 'ARRIVED'].includes(String(b.orderStatus || ''))) throw new HttpError(409, 'Delivery accept / shuru ho chuki hai, route badal nahi sakte.');
     const c = await db().doc(`customers/${b.customerId}`).get();
     const areaId = c.exists ? String(c.get('areaId') || '') : '';
     const r = await computeFor(b.agencyId, areaId, nowMs, bookingId);
     const TS = FV().serverTimestamp();
     if (r.ok) {
-      await ref.update({ routeStatus: 'PLANNED', routeAgentId: r.agentId, routeAgentName: r.agentName, expectedDeliveryDate: r.date, routeAreaId: areaId, routeAt: TS, updatedAt: TS });
+      const planned = { routeStatus: 'PLANNED', routeAgentId: r.agentId, routeAgentName: r.agentName, expectedDeliveryDate: r.date, routeAreaId: areaId, routeAt: TS, updatedAt: TS };
+      const ag = await db().doc(`deliveryAgents/${r.agentId}`).get();
+      const agentUid = ag.exists && ag.get('status') === 'ACTIVE' ? String(ag.get('authUid') || '') : '';
+      let assigned = false;
+      await db().runTransaction(async (tx) => {
+        const cur = await tx.get(ref);
+        const x = cur.data() || {};
+        const upd = { ...planned };
+        assigned = false;
+        if (agentUid && x.status === 'Approved' && (!x.orderStatus || ['CONFIRMED', 'ASSIGNED'].includes(x.orderStatus)) && (!x.agentUid || force)) {
+          Object.assign(upd, { orderStatus: 'ASSIGNED', agentId: r.agentId, agentUid, agentName: r.agentName, agentMobile: ag.get('mobile') || '',
+            assignedAt: TS, assignedBy: 'auto-route', acceptedAt: FV().delete() });
+          assigned = true;
+        }
+        tx.update(ref, upd);
+      });
+      if (assigned) await safe(() => sendToUsers([agentUid], { type: 'AGENT_ASSIGNED', agencyId: b.agencyId, bookingId, dedupeKey: `ROUTE_AGENT_${bookingId}_${r.agentId}`,
+        title: 'Nayi delivery assign hui 🚚', body: `${b.customerName || 'Customer'} • ${niceDate(r.date)}` }));
       await safe(() => sendToUsers([b.customerId], { type: 'ROUTE_PLANNED', agencyId: b.agencyId, bookingId, dedupeKey: `ROUTE_${bookingId}_${r.date}_${r.agentId}`,
         title: 'Delivery date tay ho gayi', body: `Aapka cylinder ${niceDate(r.date)} ko aayega. Delivery partner: ${r.agentName}` }));
-      return { route: { status: 'PLANNED', agentId: r.agentId, agentName: r.agentName, date: r.date, day: r.day } };
+      return { route: { status: 'PLANNED', agentId: r.agentId, agentName: r.agentName, date: r.date, day: r.day, assigned } };
     }
     await ref.update({ routeStatus: r.reason, routeAgentId: FV().delete(), routeAgentName: FV().delete(), expectedDeliveryDate: FV().delete(),
       routeAreaId: areaId || null, routeAt: TS, updatedAt: TS });

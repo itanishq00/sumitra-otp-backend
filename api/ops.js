@@ -36,8 +36,11 @@ async function ownerAgency(dec) {
 async function cancelBooking(dec, b) {
   const ref = db().doc(`bookings/${String(b.bookingId || '')}`); const s = await ref.get();
   if (!b.bookingId || !s.exists || s.get('customerId') !== dec.uid) throw new HttpError(404, 'Booking nahi mili.');
-  if (s.get('status') !== 'Pending' || s.get('agentUid')) throw new HttpError(409, 'Sirf pending booking (approve hone se pehle) cancel ho sakti hai.');
-  await ref.update({ status: 'Rejected', cancelledByCustomer: true, cancelReason: 'Customer ne khud cancel kiya', cancelledAt: FV().serverTimestamp(), updatedAt: FV().serverTimestamp() });
+  const sx = s.data();
+  const pendingOk = sx.status === 'Pending' && !sx.agentUid;
+  const autoOk = sx.status === 'Approved' && sx.autoConfirmed === true && prevDeducted(sx) === 0 && ['CONFIRMED', 'ASSIGNED'].includes(String(sx.orderStatus || ''));
+  if (!pendingOk && !autoOk) throw new HttpError(409, 'Ye booking ab cancel nahi ho sakti (agent accept kar chuka hai ya agency ne approve kar di hai). Agency se sampark karo.');
+  await ref.update({ status: 'Rejected', orderStatus: 'CANCELLED', cancelledByCustomer: true, cancelReason: 'Customer ne khud cancel kiya', cancelledAt: FV().serverTimestamp(), updatedAt: FV().serverTimestamp() });
   const all = await db().collection('bookings').where('customerId', '==', dec.uid).get();
   let prev = null;
   for (const d of all.docs) { if (d.id === s.id || d.get('status') === 'Rejected') continue; if (!prev || ms(d.get('createdAt')) > ms(prev.get('createdAt'))) prev = d; }
@@ -55,7 +58,9 @@ async function setSlot(dec, b) {
   if (!SLOTS.includes(b.slot)) throw new HttpError(400, 'Galat time slot.');
   const ref = db().doc(`bookings/${String(b.bookingId || '')}`); const s = await ref.get();
   if (!b.bookingId || !s.exists || s.get('customerId') !== dec.uid) throw new HttpError(404, 'Booking nahi mili.');
-  if (s.get('status') !== 'Pending') throw new HttpError(409, 'Slot sirf pending booking me badal sakte hain.');
+  const sy = s.data();
+  const slotOk = sy.status === 'Pending' || (sy.status === 'Approved' && sy.autoConfirmed === true && ['CONFIRMED', 'ASSIGNED'].includes(String(sy.orderStatus || '')));
+  if (!slotOk) throw new HttpError(409, 'Slot ab badal nahi sakte.');
   await ref.update({ preferredSlot: b.slot, updatedAt: FV().serverTimestamp() });
   return { message: 'Slot save ho gaya.' };
 }
@@ -121,6 +126,72 @@ async function ownerBooking(dec, b) {
   await safe(() => sendToUsers([c.id], { type: 'BOOKING_CREATED', agencyId, bookingId: ref.id, dedupeKey: `OWNER_BOOKING_${ref.id}`,
     title: 'Aapki booking ho gayi', body: `Agency ne aapke liye 1 × ${type} cylinder book kiya hai.` }));
   return { message: emergency ? 'Emergency booking ho gayi. Approve karke agent assign karo; agent ke pahunchne par "Bina OTP handover" karo.' : 'Booking ho gayi (Pending).', bookingId: ref.id };
+}
+
+// Customer app booking: backend validate karta hai; normal booking owner approval ke bina auto-confirm hoti hai.
+async function customerBooking(dec, b) {
+  if (dec.role && dec.role !== 'customer') throw new HttpError(403, 'Ye customer account nahi hai.');
+  const cref = db().doc(`customers/${dec.uid}`);
+  const pre = await cref.get();
+  if (!pre.exists || !pre.get('agencyId')) throw new HttpError(404, 'Customer account nahi mila.');
+  const agencyId = pre.get('agencyId');
+  const type = String(pre.get('assignedCylinderType') || '');
+  if (!type) throw new HttpError(409, 'Aapke connection par abhi cylinder allot nahi hua. Agency se sampark karo.');
+  const slot = SLOTS.includes(b.slot) ? b.slot : null;
+  let unitPrice = null;
+  for (const id of [`${agencyId}__prices`, 'prices']) {
+    const p = await db().doc(`settings/${id}`).get();
+    const v = p.exists ? (p.get('prices') || {})[type] : undefined;
+    if (typeof v === 'number') { unitPrice = Math.round(v); break; }
+  }
+  const bref = db().collection('bookings').doc();
+  let confirmed = false;
+  await db().runTransaction(async (tx) => {
+    const c = await tx.get(cref);
+    const hist = await tx.get(db().collection('bookings').where('customerId', '==', dec.uid));
+    const cyl = await tx.get(db().doc(`inventory/${agencyId}__cylinder`));
+    if (!c.exists || c.get('agencyId') !== agencyId) throw new HttpError(404, 'Customer account nahi mila.');
+    if ((c.get('verificationStatus') || 'verified') !== 'verified' || c.get('active') === false || c.get('deleted') === true) throw new HttpError(409, 'Aapka account verified / active nahi hai.');
+    if (String(c.get('assignedCylinderType') || '') !== type) throw new HttpError(409, 'Cylinder type badal gaya hai. Dobara try karo.');
+    if (hist.docs.some(isActive)) throw new HttpError(409, 'Aapki ek booking pehle se chal rahi hai. Ek samay par ek hi cylinder book ho sakta hai.');
+    if (c.get('emergencyPendingId')) throw new HttpError(409, 'Pichhle emergency cylinder ka hisaab baaki hai. Pehle use poora karo.');
+    let last = ms(c.get('lastBookingAt'));
+    for (const d of hist.docs) {
+      if (d.get('status') === 'Rejected' || d.get('isEmergency') === true) continue;
+      const t = ms(d.get('createdAt')) || ms(d.get('bookingDate'));
+      if (t > last) last = t;
+    }
+    if (last && Date.now() - last < GAP_DAYS * 86400e3) {
+      const left = Math.ceil((last + GAP_DAYS * 86400e3 - Date.now()) / 86400e3);
+      throw new HttpError(409, `Agli booking ${left} din baad ho sakti hai (${GAP_DAYS} din ka niyam).`);
+    }
+    const size = sizeKey(type);
+    const filled = size ? (Number((cyl.data() || {})[`filled${size}`]) || 0) : 0;
+    confirmed = !!size && filled >= 1;
+    const TS = FV().serverTimestamp();
+    tx.set(bref, {
+      agencyId, customerId: dec.uid, customerName: c.get('name') || 'Customer', customerMobile: c.get('mobile') || '',
+      consumerNumber: c.get('consumerNumber') || null, cylinderType: type, quantity: 1,
+      status: confirmed ? 'Approved' : 'Pending',
+      ...(confirmed ? { orderStatus: 'CONFIRMED', autoConfirmed: true, approvedBy: 'auto', approvedAt: TS, statusChangedAt: TS } : {}),
+      ...(unitPrice !== null ? { unitPrice, totalAmount: unitPrice, paymentMethod: 'COD', paymentStatus: 'CASH_PENDING' } : {}),
+      ...(slot ? { preferredSlot: slot } : {}),
+      source: 'customerApp', bookingDate: TS, createdAt: TS, updatedAt: TS,
+    });
+    tx.update(cref, { lastBookingAt: TS, lastBookingId: bref.id, updatedAt: TS });
+  });
+  const name = pre.get('name') || 'Customer';
+  await audit(agencyId, dec.uid, 'customer', confirmed ? 'CUSTOMER_BOOKING_AUTO_CONFIRMED' : 'CUSTOMER_BOOKING_PENDING', 'booking', bref.id, { type, confirmed });
+  let route = { status: 'NONE' };
+  try { const r = await ROUTE.assignRoute(bref.id); if (r && r.route) route = r.route; } catch (e) { console.error('customer-booking route:', e.message); }
+  const assigned = route.assigned === true;
+  await safe(async () => sendToUsers(await ownerUids(agencyId), { type: 'BOOKING_CREATED', agencyId, bookingId: bref.id, dedupeKey: `CUST_BOOKING_OWNER_${bref.id}`,
+    title: confirmed ? 'Naya booking (auto-confirm)' : 'Naya booking approval ke liye', body: `${name}: 1 × ${type}` }));
+  if (confirmed && !assigned && route.status !== 'NO_MATCH') await safe(async () => sendToUsers(await ownerUids(agencyId), { type: 'ROUTE_NO_MATCH', agencyId, bookingId: bref.id,
+    dedupeKey: `CUST_BOOKING_NOROUTE_${bref.id}`, title: 'Agent assign karo', body: `${name}: booking confirm hai, par delivery agent auto-assign nahi hua.` }));
+  await safe(() => sendToUsers([dec.uid], { type: 'BOOKING_CREATED', agencyId, bookingId: bref.id, dedupeKey: `CUST_BOOKING_${bref.id}`,
+    title: confirmed ? 'Booking confirm ho gayi ✅' : 'Booking mil gayi', body: confirmed ? `Aapka 1 × ${type} cylinder confirm ho gaya hai.` : `Aapka 1 × ${type} cylinder booking mil gayi. Agency jaldi approve karegi.` }));
+  return { message: confirmed ? 'Booking confirm ho gayi.' : 'Booking mil gayi. Stock kam hone se agency approve karegi.', bookingId: bref.id, confirmed, route };
 }
 
 async function cashAdd(dec, b) {
@@ -410,7 +481,7 @@ async function pendingOtpRemove(dec, b) {
   return { message: 'Entry hata di. Pending OTP count 1 kam ho gaya.' };
 }
 
-const ACTIONS = { 'delete-account': deleteAccount, 'cancel-booking': cancelBooking, 'set-slot': setSlot, 'service-request': serviceRequest, 'owner-booking': ownerBooking, 'cash-add': cashAdd, 'cash-list': cashList, 'emergency-handover': emergencyHandover, 'pending-otp-list': pendingOtpList, 'pending-otp-settle': pendingOtpSettle, 'pending-otp-resend': pendingOtpResend, 'emergency-history': emergencyHistory, 'duty-logs': dutyLogs, 'pending-otp-add': pendingOtpAdd, 'pending-otp-remove': pendingOtpRemove };
+const ACTIONS = { 'delete-account': deleteAccount, 'cancel-booking': cancelBooking, 'set-slot': setSlot, 'service-request': serviceRequest, 'owner-booking': ownerBooking, 'customer-booking': customerBooking, 'cash-add': cashAdd, 'cash-list': cashList, 'emergency-handover': emergencyHandover, 'pending-otp-list': pendingOtpList, 'pending-otp-settle': pendingOtpSettle, 'pending-otp-resend': pendingOtpResend, 'emergency-history': emergencyHistory, 'duty-logs': dutyLogs, 'pending-otp-add': pendingOtpAdd, 'pending-otp-remove': pendingOtpRemove };
 const ROUTE = require('./_lib/routeOps')({ db, FV, HttpError, ownerAgency, sendToUsers, ownerUids, audit, safe });
 Object.assign(ACTIONS, ROUTE.actions);
 
